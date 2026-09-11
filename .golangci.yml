@@ -1,0 +1,63 @@
+version: "2"
+run:
+  tests: true
+linters:
+  enable:
+    - wsl_v5
+    - nlreturn
+    - bodyclose
+    - contextcheck
+    - gocritic
+    - prealloc
+    - revive
+    - gosec
+    - noctx
+    - unconvert
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - unnamedResult
+        - paramTypeCombine
+        - hugeParam
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: line-length-limit
+          arguments: [120]
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - gocritic
+          - prealloc
+          - revive
+          - wsl
+          - wsl_v5
+          - govet
+        path: _test\.go
+    paths:
+      - vendor
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - vendor
