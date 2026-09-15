@@ -3,11 +3,11 @@ module github.com/nexssp/transportnats
 go 1.26.0
 
 require (
-	github.com/nats-io/nats-server/v2 v2.14.6
+	github.com/nats-io/nats-server/v2 v2.14.7
 	github.com/nats-io/nats.go v1.53.1
 	github.com/nats-io/nkeys v0.4.16
-	github.com/nexssp/kernel v0.10.0
-	github.com/nexssp/transport v0.2.0
+	github.com/nexssp/kernel v0.11.2
+	github.com/nexssp/transport v0.2.3
 )
 
 require (

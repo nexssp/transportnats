@@ -884,7 +884,6 @@ func (t *Transport) ensureDurableInfra(js nats.JetStreamContext, b DurableBindin
 	return t.ensureStream(js, b.Stream+"_DLQ", b.DeadLetterSubject)
 }
 
-// ensureStream tworzy strumień z podaną listą tematów lub rozszerza istniejący o brakujące tematy.
 func (t *Transport) ensureStream(js nats.JetStreamContext, name string, subjects ...string) error {
 	if len(subjects) == 0 {
 		return nil
@@ -1038,9 +1037,9 @@ func sanitizeURL(rawURL string) string {
 
 func injectContextHeaders(ctx context.Context, msg *nats.Msg) {
 	reqID := xctx.RequestIDFrom(ctx)
-	execID := action.ExecutionIDFrom(ctx)
-	traceID := action.TraceIDFrom(ctx)
-	spanID := action.SpanIDFrom(ctx)
+	execID := xctx.ExecutionIDFrom(ctx)
+	traceID := xctx.TraceIDFrom(ctx)
+	spanID := xctx.SpanIDFrom(ctx)
 
 	if reqID == "" && execID == "" && traceID == "" && spanID == "" {
 		return
@@ -1078,21 +1077,23 @@ func extractContextHeaders(ctx context.Context, msg *nats.Msg, scope *xctx.Reque
 	}
 
 	if execID := msg.Header.Get(transport.HeaderExecutionID); execID != "" {
-		ctx = action.WithExecutionID(ctx, execID)
+		scope.ExecutionID = execID
+		ctx = xctx.WithExecutionID(ctx, execID)
 	}
 
-	traceID := msg.Header.Get(transport.HeaderTraceID)
+	if traceID := msg.Header.Get(transport.HeaderTraceID); traceID != "" {
+		scope.TraceID = traceID
+		ctx = xctx.WithTraceID(ctx, traceID)
+	}
 
-	spanID := msg.Header.Get(transport.HeaderSpanID)
-	if traceID != "" || spanID != "" {
-		ctx = action.WithTraceContext(ctx, traceID, spanID)
+	if spanID := msg.Header.Get(transport.HeaderSpanID); spanID != "" {
+		scope.SpanID = spanID
+		ctx = xctx.WithSpanID(ctx, spanID)
 	}
 
 	return ctx
 }
 
-// subjectPatternCovers reports whether an existing stream subject pattern
-// already accepts a concrete subject, avoiding invalid wildcard overlaps.
 func subjectPatternCovers(pattern, subject string) bool {
 	if pattern == subject {
 		return true
