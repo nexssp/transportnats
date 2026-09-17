@@ -2,6 +2,7 @@ package tnats
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
@@ -89,7 +90,7 @@ func WithTLS(rootCA, clientCert, clientKey string) Option {
 	}
 }
 
-// WithURLs agreguje wiele adresów klastra NATS dla wsparcia automatycznego failoveru.
+// WithURLs agreguje wiele addressów klastra NATS dla wsparcia automatycznego failoveru.
 func WithURLs(primary string, extra ...string) Option {
 	return func(t *Transport) {
 		urls := append([]string{primary}, extra...)
@@ -106,9 +107,11 @@ func joinNATSURLs(urls []string) string {
 	}
 
 	out := urls[0]
+	var outSb109 strings.Builder
 	for _, u := range urls[1:] {
-		out += "," + u
+		outSb109.WriteString("," + u)
 	}
+	out += outSb109.String()
 
 	return out
 }

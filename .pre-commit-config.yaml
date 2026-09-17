@@ -24,8 +24,6 @@ repos:
         language: system
         pass_filenames: false
         types: [go]
-        env:
-          GOWORK: "off"
 
       - id: go-test
         name: go test
@@ -33,8 +31,6 @@ repos:
         language: system
         pass_filenames: false
         types: [go]
-        env:
-          GOWORK: "off"
 
       - id: go-vet
         name: go vet
@@ -43,8 +39,6 @@ repos:
         pass_filenames: false
         types: [go]
         stages: [pre-push]
-        env:
-          GOWORK: "off"
 
       - id: go-test-race
         name: go test -race
@@ -53,5 +47,3 @@ repos:
         pass_filenames: false
         types: [go]
         stages: [pre-push]
-        env:
-          GOWORK: "off"

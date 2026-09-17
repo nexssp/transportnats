@@ -19,8 +19,7 @@ func TestObjectStore_ExceedsMaxBytes_ReturnsError(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
 
 	tr := tnats.New(natsURL)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
@@ -42,7 +41,7 @@ func TestObjectStore_ExceedsMaxBytes_ReturnsError(t *testing.T) {
 	}
 
 	var failureCount atomic.Int32
-	objAct := action.New("obj.strict", func(ctx context.Context, ev tnats.ObjectEvent) (string, error) {
+	objAct := action.New("obj.strict", func(_ context.Context, ev tnats.ObjectEvent) (string, error) {
 		if len(ev.Data) == 0 {
 			failureCount.Add(1)
 		}
@@ -66,7 +65,7 @@ func TestConsumer_MultiFilter_HappyPath(t *testing.T) {
 	multiBinding := tnats.Consumer("MULTI_STREAM", "events.orders.eu", "multi-filter-worker").
 		WithFilters("events.orders.eu", "events.orders.us")
 
-	multiAct := action.New("orders.multifilter", func(ctx context.Context, req OrderReq) (string, error) {
+	multiAct := action.New("orders.multifilter", func(_ context.Context, _ OrderReq) (string, error) {
 		receivedCount.Add(1)
 
 		return "ok", nil
@@ -75,8 +74,7 @@ func TestConsumer_MultiFilter_HappyPath(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{multiAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
 	if err := tr.WaitReady(ctx); err != nil {
@@ -118,7 +116,7 @@ func TestConsumer_PoisonPillWithoutDLQ_Terminates(t *testing.T) {
 		WithBackOff(10*time.Millisecond, 20*time.Millisecond)
 	binding.MaxDeliver = 3
 
-	failAct := action.New("poison.action", func(ctx context.Context, req OrderReq) (string, error) {
+	failAct := action.New("poison.action", func(_ context.Context, _ OrderReq) (string, error) {
 		deliveries.Add(1)
 
 		return "", errors.New("unrecoverable database corruption")
@@ -127,8 +125,7 @@ func TestConsumer_PoisonPillWithoutDLQ_Terminates(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{failAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
 	if err := tr.WaitReady(ctx); err != nil {

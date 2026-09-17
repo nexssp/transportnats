@@ -1,6 +1,7 @@
 package tnats_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"sync/atomic"
@@ -28,7 +29,7 @@ func TestIdempotency_HappyPath_Deduplication(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
 
 	var executions atomic.Int32
-	payAct := action.New("payment.charge", func(ctx context.Context, req PaymentReq) (PaymentRes, error) {
+	payAct := action.New("payment.charge", func(_ context.Context, req PaymentReq) (PaymentRes, error) {
 		executions.Add(1)
 
 		return PaymentRes{TxID: "tx_" + req.ID, Status: "CONFIRMED"}, nil
@@ -40,8 +41,7 @@ func TestIdempotency_HappyPath_Deduplication(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{payAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
 	if err := tr.WaitReady(ctx); err != nil {
@@ -69,7 +69,7 @@ func TestIdempotency_HappyPath_Deduplication(t *testing.T) {
 		t.Fatalf("second duplicate request failed: %v", err)
 	}
 
-	if string(res1.Data) != string(res2.Data) {
+	if !bytes.Equal(res1.Data, res2.Data) {
 		t.Fatalf("cached response mismatch: %s != %s", string(res1.Data), string(res2.Data))
 	}
 
@@ -83,7 +83,7 @@ func TestIdempotency_BadPath_PayloadConflict(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
 
 	var executions atomic.Int32
-	payAct := action.New("payment.conflict", func(ctx context.Context, req PaymentReq) (PaymentRes, error) {
+	payAct := action.New("payment.conflict", func(_ context.Context, req PaymentReq) (PaymentRes, error) {
 		executions.Add(1)
 
 		return PaymentRes{TxID: "tx_" + req.ID, Status: "CONFIRMED"}, nil
@@ -95,8 +95,7 @@ func TestIdempotency_BadPath_PayloadConflict(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{payAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
 	if err := tr.WaitReady(ctx); err != nil {
@@ -146,7 +145,7 @@ func TestIdempotency_BadPath_ConcurrentInProgress(t *testing.T) {
 	started := make(chan struct{})
 	block := make(chan struct{})
 
-	slowAct := action.New("payment.slow", func(ctx context.Context, req PaymentReq) (PaymentRes, error) {
+	slowAct := action.New("payment.slow", func(_ context.Context, _ PaymentReq) (PaymentRes, error) {
 		select {
 		case started <- struct{}{}:
 		default:
@@ -162,8 +161,7 @@ func TestIdempotency_BadPath_ConcurrentInProgress(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{slowAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
 	if err := tr.WaitReady(ctx); err != nil {

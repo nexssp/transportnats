@@ -175,153 +175,21 @@ func (t *Transport) subscribeConsumer(
 	t.mu.Unlock()
 
 	t.workersWg.Add(1)
-	go t.consumeGeneric(ctx, nc, js, sub, ex, b, meta)
+	go t.runFetchLoop(ctx, nc, sub, func(msg *nats.Msg) {
+		t.handleConsumerMessage(ctx, js, ex, b, meta, msg)
+	})
 
 	return nil
 }
 
-func (t *Transport) ensureConsumerInfra(js nats.JetStreamContext, b ConsumerBinding) error {
-	subjects := []string{b.Subject}
-	if len(b.FilterSubjects) > 0 {
-		subjects = b.FilterSubjects
-	}
-	// Rejestrujemy komplet tematów w strumieniu, aby NATS zaakceptował filtr konsumenta
-	if err := t.ensureStream(js, b.Stream, subjects...); err != nil {
-		return err
-	}
-
-	if b.DeadLetterSubject != "" {
-		if err := t.ensureStream(js, b.Stream+"_DLQ", b.DeadLetterSubject); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (t *Transport) openConsumerSubscription(js nats.JetStreamContext, b ConsumerBinding) (*nats.Subscription, error) {
-	if len(b.FilterSubjects) > 0 {
-		opts := []nats.SubOpt{
-			nats.BindStream(b.Stream),
-			nats.ConsumerFilterSubjects(b.FilterSubjects...),
-			nats.AckWait(b.AckWait),
-			nats.MaxDeliver(b.MaxDeliver),
-			nats.MaxAckPending(b.MaxAckPending),
-		}
-		switch b.AckPolicy {
-		case AckNone:
-			opts = append(opts, nats.AckNone())
-		case AckAll:
-			opts = append(opts, nats.AckAll())
-		default:
-			opts = append(opts, nats.AckExplicit())
-		}
-
-		switch b.DeliverPolicy {
-		case DeliverLast:
-			opts = append(opts, nats.DeliverLast())
-		case DeliverNew:
-			opts = append(opts, nats.DeliverNew())
-		case DeliverByStartSequence:
-			opts = append(opts, nats.StartSequence(b.OptStartSeq))
-		case DeliverByStartTime:
-			opts = append(opts, nats.StartTime(b.OptStartTime))
-		case DeliverLastPerSubject:
-			opts = append(opts, nats.DeliverLastPerSubject())
-		default:
-			opts = append(opts, nats.DeliverAll())
-		}
-
-		if b.ReplayPolicy == ReplayOriginal {
-			opts = append(opts, nats.ReplayOriginal())
-		} else {
-			opts = append(opts, nats.ReplayInstant())
-		}
-
-		if len(b.BackOff) > 0 {
-			opts = append(opts, nats.BackOff(b.BackOff))
-		}
-
-		if b.RateLimitBits > 0 {
-			opts = append(opts, nats.RateLimit(b.RateLimitBits))
-		}
-
-		if b.HeadersOnly {
-			opts = append(opts, nats.HeadersOnly())
-		}
-
-		sub, err := js.PullSubscribe("", b.Durable, opts...)
-		if err != nil {
-			return nil, MapError(err)
-		}
-
-		return sub, nil
-	}
-
-	opts := []nats.SubOpt{
-		nats.BindStream(b.Stream),
-		nats.AckWait(b.AckWait),
-		nats.MaxDeliver(b.MaxDeliver),
-		nats.MaxAckPending(b.MaxAckPending),
-	}
-
-	switch b.AckPolicy {
-	case AckNone:
-		opts = append(opts, nats.AckNone())
-	case AckAll:
-		opts = append(opts, nats.AckAll())
-	default:
-		opts = append(opts, nats.AckExplicit())
-	}
-
-	switch b.DeliverPolicy {
-	case DeliverLast:
-		opts = append(opts, nats.DeliverLast())
-	case DeliverNew:
-		opts = append(opts, nats.DeliverNew())
-	case DeliverByStartSequence:
-		opts = append(opts, nats.StartSequence(b.OptStartSeq))
-	case DeliverByStartTime:
-		opts = append(opts, nats.StartTime(b.OptStartTime))
-	case DeliverLastPerSubject:
-		opts = append(opts, nats.DeliverLastPerSubject())
-	default:
-		opts = append(opts, nats.DeliverAll())
-	}
-
-	switch b.ReplayPolicy {
-	case ReplayOriginal:
-		opts = append(opts, nats.ReplayOriginal())
-	default:
-		opts = append(opts, nats.ReplayInstant())
-	}
-
-	if len(b.BackOff) > 0 {
-		opts = append(opts, nats.BackOff(b.BackOff))
-	}
-
-	if b.RateLimitBits > 0 {
-		opts = append(opts, nats.RateLimit(b.RateLimitBits))
-	}
-
-	if b.HeadersOnly {
-		opts = append(opts, nats.HeadersOnly())
-	}
-
-	sub, err := js.PullSubscribe(b.Subject, b.Durable, opts...)
-	if err != nil {
-		return nil, MapError(err)
-	}
-
-	return sub, nil
-}
-
-func (t *Transport) consumeGeneric(
-	ctx context.Context, nc *nats.Conn, js nats.JetStreamContext,
-	sub *nats.Subscription, ex action.Executable, b ConsumerBinding, meta *action.Meta,
+// runFetchLoop is the shared pull-consumer pump used by both Durable and
+// Consumer bindings. It fetches batches, handles timeouts/reconnects, and
+// dispatches each message to handle.
+func (t *Transport) runFetchLoop(
+	ctx context.Context, nc *nats.Conn, sub *nats.Subscription, handle func(*nats.Msg),
 ) {
 	defer t.workersWg.Done()
-	defer func() { _ = sub.Unsubscribe() }()
+	defer func() { _ = sub.Unsubscribe() }() //nolint:errcheck // unsubscribe on shutdown is best-effort
 
 	for {
 		if ctx.Err() != nil {
@@ -352,9 +220,112 @@ func (t *Transport) consumeGeneric(
 		}
 
 		for _, msg := range msgs {
-			t.handleConsumerMessage(ctx, js, ex, b, meta, msg)
+			handle(msg)
 		}
 	}
+}
+
+func (t *Transport) ensureConsumerInfra(js nats.JetStreamContext, b ConsumerBinding) error {
+	subjects := []string{b.Subject}
+	if len(b.FilterSubjects) > 0 {
+		subjects = b.FilterSubjects
+	}
+	// Register all subjects on the stream so NATS accepts the consumer filter.
+	if err := t.ensureStream(js, b.Stream, subjects...); err != nil {
+		return err
+	}
+
+	if b.DeadLetterSubject != "" {
+		if err := t.ensureStream(js, b.Stream+"_DLQ", b.DeadLetterSubject); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func applyAckPolicyOpts(opts []nats.SubOpt, p AckPolicy) []nats.SubOpt {
+	switch p {
+	case AckNone:
+		return append(opts, nats.AckNone())
+	case AckAll:
+		return append(opts, nats.AckAll())
+	case AckExplicit:
+		return append(opts, nats.AckExplicit())
+	}
+
+	return append(opts, nats.AckExplicit())
+}
+
+func applyDeliverPolicyOpts(opts []nats.SubOpt, b ConsumerBinding) []nats.SubOpt {
+	switch b.DeliverPolicy {
+	case DeliverLast:
+		return append(opts, nats.DeliverLast())
+	case DeliverNew:
+		return append(opts, nats.DeliverNew())
+	case DeliverByStartSequence:
+		return append(opts, nats.StartSequence(b.OptStartSeq))
+	case DeliverByStartTime:
+		return append(opts, nats.StartTime(b.OptStartTime))
+	case DeliverLastPerSubject:
+		return append(opts, nats.DeliverLastPerSubject())
+	case DeliverAll:
+		return append(opts, nats.DeliverAll())
+	}
+
+	return append(opts, nats.DeliverAll())
+}
+
+func applyReplayPolicyOpts(opts []nats.SubOpt, p ReplayPolicy) []nats.SubOpt {
+	switch p {
+	case ReplayOriginal:
+		return append(opts, nats.ReplayOriginal())
+	case ReplayInstant:
+		return append(opts, nats.ReplayInstant())
+	}
+
+	return append(opts, nats.ReplayInstant())
+}
+
+func (t *Transport) openConsumerSubscription(js nats.JetStreamContext, b ConsumerBinding) (*nats.Subscription, error) {
+	opts := []nats.SubOpt{
+		nats.BindStream(b.Stream),
+		nats.AckWait(b.AckWait),
+		nats.MaxDeliver(b.MaxDeliver),
+		nats.MaxAckPending(b.MaxAckPending),
+	}
+
+	if len(b.FilterSubjects) > 0 {
+		opts = append(opts, nats.ConsumerFilterSubjects(b.FilterSubjects...))
+	}
+
+	opts = applyAckPolicyOpts(opts, b.AckPolicy)
+	opts = applyDeliverPolicyOpts(opts, b)
+	opts = applyReplayPolicyOpts(opts, b.ReplayPolicy)
+
+	if len(b.BackOff) > 0 {
+		opts = append(opts, nats.BackOff(b.BackOff))
+	}
+
+	if b.RateLimitBits > 0 {
+		opts = append(opts, nats.RateLimit(b.RateLimitBits))
+	}
+
+	if b.HeadersOnly {
+		opts = append(opts, nats.HeadersOnly())
+	}
+
+	subject := b.Subject
+	if len(b.FilterSubjects) > 0 {
+		subject = ""
+	}
+
+	sub, err := js.PullSubscribe(subject, b.Durable, opts...)
+	if err != nil {
+		return nil, MapError(err)
+	}
+
+	return sub, nil
 }
 
 func (t *Transport) handleConsumerMessage(
@@ -390,7 +361,7 @@ func (t *Transport) handleConsumerMessage(
 		ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
 		defer cancel()
 
-		_ = msg.AckSync(nats.Context(ackCtx))
+		_ = msg.AckSync(nats.Context(ackCtx)) //nolint:errcheck // ack failure is not recoverable by the handler
 
 		return
 	}
@@ -400,15 +371,15 @@ func (t *Transport) handleConsumerMessage(
 		if b.DeadLetterSubject != "" {
 			t.dlqConsumerMessage(js, b, msg, execErr, metaInfo.NumDelivered)
 		} else {
-			_ = msg.Term()
+			_ = msg.Term() //nolint:errcheck // terminal state; no retry possible
 		}
 
 		return
 	}
 
-	// Gdy zdefiniowano BackOff, delegujemy interwały bezpośrednio do silnika JetStream (szybkie ponowienia)
+	// When BackOff is defined, let the JetStream engine drive retry intervals.
 	if len(b.BackOff) > 0 {
-		_ = msg.Nak()
+		_ = msg.Nak() //nolint:errcheck // NAck failure falls back to AckWait redelivery
 
 		return
 	}
@@ -418,7 +389,7 @@ func (t *Transport) handleConsumerMessage(
 		delay = retryable.RetryAfter()
 	}
 
-	_ = msg.NakWithDelay(delay)
+	_ = msg.NakWithDelay(delay) //nolint:errcheck // NAck failure falls back to AckWait redelivery
 }
 
 func (t *Transport) dlqConsumerMessage(
@@ -445,7 +416,7 @@ func (t *Transport) dlqConsumerMessage(
 
 	payload, err := json.Marshal(dead)
 	if err != nil {
-		_ = msg.Nak()
+		_ = msg.Nak() //nolint:errcheck // NAck failure falls back to AckWait redelivery
 
 		return
 	}
@@ -454,12 +425,12 @@ func (t *Transport) dlqConsumerMessage(
 
 	dlqMsg.Data = payload
 	if _, err := js.PublishMsg(dlqMsg); err != nil {
-		_ = msg.Nak()
+		_ = msg.Nak() //nolint:errcheck // NAck failure falls back to AckWait redelivery
 
 		return
 	}
 
-	_ = msg.Term()
+	_ = msg.Term() //nolint:errcheck // terminal state; no retry possible
 }
 
 var _ action.Binding = ConsumerBinding{}

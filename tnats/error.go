@@ -41,8 +41,7 @@ func MapError(err error) error {
 		return xerr.NotFound("nats: key not found in bucket", err)
 	}
 
-	var appErr *xerr.AppError
-	if errors.As(err, &appErr) {
+	if appErr, ok := errors.AsType[*xerr.AppError](err); ok {
 		return appErr
 	}
 

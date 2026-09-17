@@ -47,7 +47,7 @@ func BenchmarkHotPath_TokenMatching(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		// Bezpośrednie wywołanie matchera
 		if !matchDirect(name, pattern) {
 			b.Fatal("matcher failed")
@@ -111,7 +111,7 @@ func BenchmarkHotPath_HeaderInjection(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if traceID := action.TraceIDFrom(ctx); traceID != "" {
 			if msg.Header == nil {
 				msg.Header = make(nats.Header)

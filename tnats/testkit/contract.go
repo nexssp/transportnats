@@ -25,7 +25,12 @@ func StartEmbedded(t *testing.T, jetStream bool) *EmbeddedServer {
 		t.Fatalf("testkit: reserve port: %v", err)
 	}
 
-	port := l.Addr().(*net.TCPAddr).Port
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("testkit: expected *net.TCPAddr, got %T", l.Addr())
+	}
+	port := addr.Port
+
 	_ = l.Close()
 
 	opts := &natsserver.Options{
@@ -72,7 +77,7 @@ func RunContract(t *testing.T, newTransport func(t *testing.T, url string) *tnat
 	tr := newTransport(t, srv.URL)
 
 	done := make(chan struct{}, 1)
-	act := action.New("contract.ping", func(ctx context.Context, in map[string]string) (string, error) {
+	act := action.New("contract.ping", func(_ context.Context, _ map[string]string) (string, error) {
 		select {
 		case done <- struct{}{}:
 		default:
@@ -86,7 +91,7 @@ func RunContract(t *testing.T, newTransport func(t *testing.T, url string) *tnat
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() { _, _ = tr.Do(ctx, nil) }()
+	go func() { _, _ = tr.Do(ctx, nil) }() //nolint:errcheck // test goroutine; failures surface via WaitReady
 
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)

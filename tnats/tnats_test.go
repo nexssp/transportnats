@@ -18,18 +18,24 @@ import (
 	"github.com/nexssp/transportnats/tnats"
 )
 
-func TestTransportImplementsInterface(t *testing.T) {
+func TestTransportImplementsInterface(_ *testing.T) {
 	var _ transport.Transport = (*tnats.Transport)(nil)
 }
 
-func runEmbeddedNATS(t *testing.T) (*natsserver.Server, string) {
+func runEmbeddedNATS(t *testing.T) (srv *natsserver.Server, url string) {
 	t.Helper()
 
 	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed finding free test port: %v", err)
 	}
-	port := l.Addr().(*net.TCPAddr).Port
+
+	addr, ok := l.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("expected *net.TCPAddr, got %T", l.Addr())
+	}
+	port := addr.Port
+
 	_ = l.Close()
 
 	opts := &natsserver.Options{
@@ -47,6 +53,7 @@ func runEmbeddedNATS(t *testing.T) (*natsserver.Server, string) {
 	}
 
 	go server.Start()
+
 	if !server.ReadyForConnections(5 * time.Second) {
 		t.Fatal("embedded NATS server startup timed out")
 	}
@@ -74,7 +81,7 @@ func TestTNATS_PubSubAndQueueGroup(t *testing.T) {
 
 	var count atomic.Int32
 	received := make(chan struct{}, 5)
-	orderAct := action.New("order.process", func(ctx context.Context, req OrderReq) (string, error) {
+	orderAct := action.New("order.process", func(_ context.Context, _ OrderReq) (string, error) {
 		count.Add(1)
 		received <- struct{}{}
 
@@ -84,10 +91,10 @@ func TestTNATS_PubSubAndQueueGroup(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{orderAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
+
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady failed: %v", err)
 	}
@@ -99,7 +106,7 @@ func TestTNATS_PubSubAndQueueGroup(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		select {
 		case <-received:
 		case <-time.After(3 * time.Second):
@@ -116,7 +123,7 @@ func TestTNATS_RequestReply_RPC_SuccessAndError(t *testing.T) {
 	t.Parallel()
 	_, natsURL := runEmbeddedNATS(t)
 
-	rpcAct := action.New("order.rpc", func(ctx context.Context, req OrderReq) (OrderRes, error) {
+	rpcAct := action.New("order.rpc", func(_ context.Context, req OrderReq) (OrderRes, error) {
 		if req.Price <= 0 {
 			return OrderRes{}, xerr.BadRequest("price must be positive")
 		}
@@ -127,10 +134,10 @@ func TestTNATS_RequestReply_RPC_SuccessAndError(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{rpcAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
+
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady failed: %v", err)
 	}
@@ -150,8 +157,7 @@ func TestTNATS_RequestReply_RPC_SuccessAndError(t *testing.T) {
 		t.Fatal("expected request error, got nil")
 	}
 
-	var appErr *xerr.AppError
-	if !errors.As(err, &appErr) {
+	if _, ok := errors.AsType[*xerr.AppError](err); !ok {
 		t.Fatalf("expected *xerr.AppError, got: %T (%v)", err, err)
 	}
 }
@@ -166,17 +172,17 @@ func TestTNATS_Consumer_DeliveryAndDeadLetter(t *testing.T) {
 		ToDeadLetter("events.dlq")
 	binding.MaxDeliver = 3
 
-	failingAct := action.New("consumer.fail", func(ctx context.Context, req OrderReq) (string, error) {
+	failingAct := action.New("consumer.fail", func(_ context.Context, _ OrderReq) (string, error) {
 		return "", errors.New("business failure")
 	}).Route(binding).Build()
 
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{failingAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
+
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
@@ -219,7 +225,7 @@ func TestTNATS_ObjectStore_LifecycleAndWatch(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
 
 	received := make(chan tnats.ObjectEvent, 2)
-	objAct := action.New("obj.handler", func(ctx context.Context, ev tnats.ObjectEvent) (string, error) {
+	objAct := action.New("obj.handler", func(_ context.Context, ev tnats.ObjectEvent) (string, error) {
 		received <- ev
 
 		return "ok", nil
@@ -228,8 +234,7 @@ func TestTNATS_ObjectStore_LifecycleAndWatch(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{objAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
@@ -247,6 +252,7 @@ func TestTNATS_ObjectStore_LifecycleAndWatch(t *testing.T) {
 	}
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
+
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
@@ -290,17 +296,17 @@ func TestTNATS_Micro_Service_RPC(t *testing.T) {
 	t.Parallel()
 	_, natsURL := runEmbeddedNATS(t)
 
-	microAct := action.New("pricing.get", func(ctx context.Context, in OrderReq) (OrderRes, error) {
+	microAct := action.New("pricing.get", func(_ context.Context, in OrderReq) (OrderRes, error) {
 		return OrderRes{Confirmation: "PRICE_APPROVED:" + in.ID}, nil
 	}).Route(tnats.Service("pricing-svc", "1.0.0", "calculate", "pricing.v1.calc")).Build()
 
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{microAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
+
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
@@ -327,7 +333,7 @@ func TestTNATS_EmbeddedServer_Integration(t *testing.T) {
 		NoSigs:    true,
 	}))
 
-	readyAct := action.New("embedded.ping", func(ctx context.Context, _ any) (string, error) {
+	readyAct := action.New("embedded.ping", func(_ context.Context, _ any) (string, error) {
 		return "PONG", nil
 	}).Route(tnats.Request("embedded.ping")).Build()
 	tr.Mount([]action.AnyAction{readyAct})
@@ -354,6 +360,7 @@ func TestTNATS_EmbeddedServer_Integration(t *testing.T) {
 	}
 
 	cancel()
+
 	select {
 	case err := <-errCh:
 		if err != nil {
@@ -369,7 +376,7 @@ func TestTNATS_Idempotency_PanicRecovery(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
 
 	var runs atomic.Int32
-	panickingAct := action.New("order.panic.idem", func(ctx context.Context, req OrderReq) (OrderRes, error) {
+	panickingAct := action.New("order.panic.idem", func(_ context.Context, req OrderReq) (OrderRes, error) {
 		n := runs.Add(1)
 		if n == 1 {
 			panic("unexpected runtime panic")
@@ -384,15 +391,16 @@ func TestTNATS_Idempotency_PanicRecovery(t *testing.T) {
 	tr := tnats.New(natsURL)
 	tr.Mount([]action.AnyAction{panickingAct})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
+
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
 
 	var res OrderRes
+
 	_ = tr.Request(ctx, "order.panic.rpc", OrderReq{ID: "IDEM_PANIC_1", Price: 100}, &res)
 
 	err := tr.Request(ctx, "order.panic.rpc", OrderReq{ID: "IDEM_PANIC_1", Price: 100}, &res)
@@ -427,15 +435,15 @@ func TestTNATS_PublishDurable_CachedInfra(t *testing.T) {
 	binding := tnats.DurableWork("CACHED_STREAM", "cached.orders", "cached-worker", "cached.dlq")
 	tr := tnats.New(natsURL)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
+
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
 	}
 
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		if err := tr.PublishDurable(ctx, binding, OrderReq{ID: fmt.Sprintf("ord_%d", i), Price: i}); err != nil {
 			t.Fatalf("PublishDurable failed on iteration %d: %v", i, err)
 		}

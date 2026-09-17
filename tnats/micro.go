@@ -2,6 +2,7 @@ package tnats
 
 import (
 	"context"
+	"maps"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -12,7 +13,7 @@ import (
 	"github.com/nexssp/transport"
 )
 
-// ServiceBinding udostępnia akcję jako endpoint w standardzie NATS Micro Services.
+// ServiceBinding exposes an action as a NATS Micro Service endpoint.
 type ServiceBinding struct {
 	Service     string
 	Version     string
@@ -52,9 +53,7 @@ func (b ServiceBinding) WithTimeout(d time.Duration) ServiceBinding {
 
 func (b ServiceBinding) WithMetadata(md map[string]string) ServiceBinding {
 	cp := make(map[string]string, len(md))
-	for k, v := range md {
-		cp[k] = v
-	}
+	maps.Copy(cp, md)
 
 	b.Metadata = cp
 
@@ -112,7 +111,7 @@ func (t *Transport) mountMicroServices(ctx context.Context, nc *nats.Conn, actio
 
 		for i := range eps {
 			if err := t.registerMicroEndpoint(ctx, svc, eps[i]); err != nil {
-				_ = svc.Stop()
+				_ = svc.Stop() //nolint:errcheck // service stop on shutdown is best-effort
 
 				return err
 			}
@@ -165,19 +164,19 @@ func (t *Transport) registerMicroEndpoint(ctx context.Context, svc micro.Service
 		res, execErr := ep.Exec.ExecuteDecoded(reqCtx, decoder)
 		if execErr != nil {
 			appErr := xerr.From(execErr)
-			_ = req.Error(string(appErr.Kind), appErr.Error(), nil)
+			_ = req.Error(string(appErr.Kind), appErr.Error(), nil) //nolint:errcheck // micro response write failure is terminal
 
 			return
 		}
 
 		payload, mErr := t.codec.Marshal(res)
 		if mErr != nil {
-			_ = req.Error(string(xerr.KindInternal), "response marshal failed", nil)
+			_ = req.Error(string(xerr.KindInternal), "response marshal failed", nil) //nolint:errcheck // micro response write failure is terminal
 
 			return
 		}
 
-		_ = req.Respond(payload)
+		_ = req.Respond(payload) //nolint:errcheck // micro response write failure is terminal
 	}
 
 	opts := []micro.EndpointOpt{

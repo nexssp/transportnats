@@ -91,91 +91,95 @@ func (t *Transport) mountObjectStore(
 		pattern = ">"
 	}
 
-	t.workersWg.Add(1)
-	go func() {
-		defer t.workersWg.Done()
+	t.workersWg.Go(func() {
+		t.watchObjectStore(ctx, obs, ex, b, pattern)
+	})
 
-		backoff := 100 * time.Millisecond
+	return nil
+}
 
-		for {
-			if ctx.Err() != nil {
-				return
-			}
+func (t *Transport) watchObjectStore(
+	ctx context.Context, obs nats.ObjectStore, ex action.Executable, b ObjectBinding, pattern string,
+) {
+	backoff := 100 * time.Millisecond
 
-			w, wErr := obs.Watch()
-			if wErr != nil {
-				t.log.Error("object_watch_failed", "bucket", b.Bucket, "error", wErr)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
 
-				select {
-				case <-time.After(backoff):
-					if backoff < 5*time.Second {
-						backoff *= 2
-					}
-
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			backoff = 100 * time.Millisecond
-
-			stopDone := make(chan struct{})
-
-			go func() {
-				select {
-				case <-ctx.Done():
-					_ = w.Stop()
-				case <-stopDone:
-				}
-			}()
-
-			for info := range w.Updates() {
-				if ctx.Err() != nil {
-					break
-				}
-
-				if info == nil {
-					continue
-				}
-
-				if !objectNameMatches(info.Name, pattern) {
-					continue
-				}
-
-				ev := objectEventFromInfo(b, info)
-				if b.IncludeData && ev.Type == ObjectPut {
-					if data, derr := readObjectBytes(obs, info.Name, b.MaxBytes); derr == nil {
-						ev.Data = data
-					} else {
-						t.log.Warn("object_fetch_failed", "name", info.Name, "error", derr)
-					}
-				}
-
-				reqCtx, scope, release := xctx.NewScope(ctx)
-				scope.Endpoint = "nats.object." + b.Bucket + "." + info.Name
-
-				decoder := func(v any) error { return t.coerceObjectEvent(ev, v) }
-				if _, execErr := ex.ExecuteDecoded(reqCtx, decoder); execErr != nil {
-					t.log.Error("object_action_failed", "name", info.Name, "error", execErr)
-				}
-
-				release()
-			}
-
-			close(stopDone)
-
-			_ = w.Stop()
+		w, err := obs.Watch()
+		if err != nil {
+			t.log.Error("object_watch_failed", "bucket", b.Bucket, "error", err)
 
 			select {
 			case <-time.After(backoff):
+				if backoff < 5*time.Second {
+					backoff *= 2
+				}
+
+				continue
 			case <-ctx.Done():
 				return
 			}
 		}
+
+		backoff = 100 * time.Millisecond
+		t.consumeObjectEvents(ctx, obs, ex, b, pattern, w)
+
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (t *Transport) consumeObjectEvents(
+	ctx context.Context, obs nats.ObjectStore, ex action.Executable,
+	b ObjectBinding, pattern string, w nats.ObjectWatcher,
+) {
+	stopDone := make(chan struct{})
+	defer close(stopDone)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = w.Stop() //nolint:errcheck // watcher stop is best-effort
+		case <-stopDone:
+		}
 	}()
 
-	return nil
+	for info := range w.Updates() {
+		if ctx.Err() != nil {
+			break
+		}
+
+		if info == nil || !objectNameMatches(info.Name, pattern) {
+			continue
+		}
+
+		ev := objectEventFromInfo(b, info)
+		if b.IncludeData && ev.Type == ObjectPut {
+			if data, derr := readObjectBytes(obs, info.Name, b.MaxBytes); derr == nil {
+				ev.Data = data
+			} else {
+				t.log.Warn("object_fetch_failed", "name", info.Name, "error", derr)
+			}
+		}
+
+		reqCtx, scope, release := xctx.NewScope(ctx)
+		scope.Endpoint = "nats.object." + b.Bucket + "." + info.Name
+
+		decoder := func(v any) error { return t.coerceObjectEvent(ev, v) }
+		if _, execErr := ex.ExecuteDecoded(reqCtx, decoder); execErr != nil {
+			t.log.Error("object_action_failed", "name", info.Name, "error", execErr)
+		}
+
+		release()
+	}
+
+	_ = w.Stop() //nolint:errcheck // watcher stop is best-effort
 }
 
 func objectEventFromInfo(b ObjectBinding, info *nats.ObjectInfo) ObjectEvent {
@@ -195,8 +199,8 @@ func objectEventFromInfo(b ObjectBinding, info *nats.ObjectInfo) ObjectEvent {
 	return ev
 }
 
-// objectNameMatches realizuje dopasowanie masek NATS ('*', '>') bez alokacji sterty (Zero Heap Allocs).
-// Wykorzystuje arytmetykę indeksów bez wywoływania strings.Split().
+// objectNameMatches performs NATS wildcard matching ('*', '>') with zero heap
+// allocations. Uses index arithmetic instead of strings.Split.
 func objectNameMatches(name, pattern string) bool {
 	if pattern == "" || pattern == ">" {
 		return true
@@ -206,7 +210,6 @@ func objectNameMatches(name, pattern string) bool {
 	nLen, pLen := len(name), len(pattern)
 
 	for pIdx < pLen {
-		// Wyznaczenie końca tokenu we wzorcu
 		pEnd := pIdx
 		for pEnd < pLen && pattern[pEnd] != '.' {
 			pEnd++
@@ -214,7 +217,6 @@ func objectNameMatches(name, pattern string) bool {
 
 		pToken := pattern[pIdx:pEnd]
 
-		// NATS wildcard '>' dopasowuje wszystko do końca
 		if pToken == ">" {
 			return nIdx < nLen
 		}
@@ -223,7 +225,6 @@ func objectNameMatches(name, pattern string) bool {
 			return false
 		}
 
-		// Wyznaczenie końca tokenu w nazwie
 		nEnd := nIdx
 		for nEnd < nLen && name[nEnd] != '.' {
 			nEnd++
@@ -231,12 +232,10 @@ func objectNameMatches(name, pattern string) bool {
 
 		nToken := name[nIdx:nEnd]
 
-		// NATS wildcard '*' dopasowuje dokładnie jeden token
 		if pToken != "*" && pToken != nToken {
 			return false
 		}
 
-		// Przejście do następnego segmentu
 		if pEnd < pLen {
 			pIdx = pEnd + 1
 		} else {

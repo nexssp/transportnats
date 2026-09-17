@@ -33,14 +33,14 @@ type kvEntryPayload struct {
 
 var claimSequence atomic.Uint64
 
-// KVIdempotencyCoordinator implementuje action.IdempotencyCoordinator oparty o NATS JetStream KV.
+// KVIdempotencyCoordinator implements action.IdempotencyCoordinator backed by NATS JetStream KV.
 type KVIdempotencyCoordinator struct {
 	kv nats.KeyValue
 }
 
 var _ action.IdempotencyCoordinator = (*KVIdempotencyCoordinator)(nil)
 
-// NewKVIdempotencyCoordinator tworzy rozproszony koordynator idempotencji oparty o JetStream KV.
+// NewKVIdempotencyCoordinator creates a distributed idempotency coordinator backed by JetStream KV.
 func NewKVIdempotencyCoordinator(js nats.JetStreamContext, bucketName ...string) (*KVIdempotencyCoordinator, error) {
 	name := defaultIdempotencyBucket
 	if len(bucketName) > 0 && bucketName[0] != "" {
@@ -65,7 +65,7 @@ func NewKVIdempotencyCoordinator(js nats.JetStreamContext, bucketName ...string)
 	return &KVIdempotencyCoordinator{kv: kv}, nil
 }
 
-// Get pobiera zapisaną odpowiedź dla zrealizowanego żądania.
+// Get retrieves a stored response for a completed request.
 func (c *KVIdempotencyCoordinator) Get(_ context.Context, key string) (action.IdempotencyEntry, bool) {
 	entryKey := entryPrefix + key
 
@@ -92,7 +92,7 @@ func (c *KVIdempotencyCoordinator) Get(_ context.Context, key string) (action.Id
 	return entry, true
 }
 
-// Set zapisuje wynik w magazynie.
+// Set stores the result in the backend.
 func (c *KVIdempotencyCoordinator) Set(
 	_ context.Context, key string, entry action.IdempotencyEntry, ttl time.Duration,
 ) {
@@ -103,10 +103,10 @@ func (c *KVIdempotencyCoordinator) Set(
 		return
 	}
 
-	_, _ = c.kv.Put(entryKey, data)
+	_, _ = c.kv.Put(entryKey, data) //nolint:errcheck // KV put failure surfaces on the next Get
 }
 
-// Claim atomowo rezerwuje token idempotencji w NATS KV.
+// Claim atomically reserves an idempotency token in NATS KV.
 func (c *KVIdempotencyCoordinator) Claim(
 	ctx context.Context, key, requestHash string, leaseTTL time.Duration,
 ) (action.IdempotencyClaim, error) {
@@ -140,7 +140,7 @@ func (c *KVIdempotencyCoordinator) Claim(
 		return action.IdempotencyClaim{}, xerr.Internal("failed to marshal claim", err)
 	}
 
-	// Create zadziała atomowo tylko, jeśli klucz jeszcze nie istnieje w buckecie
+	// Create succeeds atomically only when the key does not yet exist.
 	_, createErr := c.kv.Create(claimKey, data)
 	if createErr == nil {
 		return action.IdempotencyClaim{
@@ -221,18 +221,24 @@ func (c *KVIdempotencyCoordinator) Complete(
 	return nil
 }
 
-// Release zwalnia rezerwację po błędzie lub panice.
-func (c *KVIdempotencyCoordinator) Release(ctx context.Context, key, token string) error {
+// Release frees the reservation after a failure or panic. Release is
+// best-effort: corrupted claim data cannot be safely deleted by token, so it
+// is left in place and expires naturally through the lease TTL.
+func (c *KVIdempotencyCoordinator) Release(_ context.Context, key, token string) error {
 	claimKey := claimPrefix + key
 
 	item, err := c.kv.Get(claimKey)
 	if err != nil {
-		return nil
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			return nil
+		}
+
+		return MapError(err)
 	}
 
 	var activeClaim kvClaimPayload
 	if jsonErr := json.Unmarshal(item.Value(), &activeClaim); jsonErr != nil {
-		return nil
+		return nil //nolint:nilerr // corrupted claim data cannot be safely released; lease expires naturally
 	}
 
 	if activeClaim.Token == token {

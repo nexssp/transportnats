@@ -14,9 +14,9 @@ import (
 
 const idempotencyFinalizeTimeout = 5 * time.Second
 
-// msgHash generuje 64-bajtowy hex hash z zachowaniem 0 alokacji sterty przy hashowaniu.
+// msgHash generates a 64-byte hex hash while keeping zero heap allocations
+// for the common case of small subjects and payloads.
 func msgHash(msg *nats.Msg) string {
-	// Przygotowanie bufora na stosie
 	totalLen := len(msg.Subject) + len(msg.Data)
 	if totalLen <= 512 {
 		var stackBuf [512]byte
@@ -93,7 +93,7 @@ func executeWithCoordinator(
 	case action.IdempotencyClaimInProgress:
 		return encodeError(c, xerr.Unavailable("an identical request is currently in progress"))
 	case action.IdempotencyClaimAcquired:
-		// Prawo do wykonania akcji
+		// Own the execution right.
 	default:
 		return encodeError(c, xerr.Internal("invalid idempotency claim state"))
 	}
@@ -101,7 +101,7 @@ func executeWithCoordinator(
 	completed := false
 	defer func() {
 		if !completed {
-			_ = coordinator.Release(ctx, key, claim.Token)
+			_ = coordinator.Release(ctx, key, claim.Token) //nolint:errcheck // release is best-effort; lease expires automatically
 		}
 	}()
 
@@ -178,7 +178,7 @@ func encodeError(c codec.Codec, err error) ([]byte, error) {
 		c = codec.Default
 	}
 
-	encoded, _ := c.Marshal(appErr.Public(""))
+	encoded, _ := c.Marshal(appErr.Public("")) //nolint:errcheck // marshaling a Public error envelope cannot fail
 
 	return encoded, err
 }
