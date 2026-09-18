@@ -12,10 +12,11 @@ repos:
 
   - repo: local
     hooks:
-      - id: gofmt
-        name: gofmt
-        entry: gofmt -w
+      - id: golangci-lint-fmt
+        name: golangci-lint fmt
+        entry: golangci-lint fmt
         language: system
+        pass_filenames: true
         types: [go]
 
       - id: golangci-lint
