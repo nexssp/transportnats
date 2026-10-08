@@ -1,0 +1,31 @@
+@description "Live Edge Configuration & JetStream Anomaly Routing"
+
+@require github.com/nexssp/transportnats/nexssflow { url: "nats://127.0.0.1:4222" }
+
+# Triggers instantly across all edge nodes when value changes in KV
+@pipeline sync_config :nats_kv="CONFIG:global_rate_limit"
+  log.warn @{ message: "Global limit updated", new_limit: .value } ->
+  runtime.noop
+@end
+
+# Drops high-cpu anomalies into a Resilient Incident Response Queue
+@pipeline detect_anomalies :nats_consumer="TELEMETRY:metrics:anomaly_detector"
+  match(.cpu_usage > 95.0) {
+    true -> {
+        stream: "INCIDENTS",
+        subject: "alerts.critical",
+        durable: "pagerduty_router",
+        dead_letter_subject: "alerts.dlq",
+        payload: .
+    } -> nats.publish_durable,
+
+    default -> runtime.noop
+  }
+@end
+
+# Registers service endpoints automatically into NATS Service Discovery
+@pipeline check_health :nats_micro="EdgeTelemetry:1.0.0:Ping:sys.edge.ping"
+  { status: "UP", version: "1.0.0" }
+@end
+
+nats.listen

@@ -7,6 +7,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nexssp/kernel/xctx"
 	"github.com/nexssp/transport"
+	"github.com/nexssp/transport/identity"
 )
 
 func sanitizeURL(rawURL string) string {
@@ -59,8 +60,7 @@ func extractContextHeaders(ctx context.Context, msg *nats.Msg, scope *xctx.Reque
 		ctx = xctx.WithRequestID(ctx, reqID)
 	}
 
-	if execID := msg.Header.Get(transport.HeaderExecutionID); execID != "" {
-		scope.ExecutionID = execID
+	if execID := msg.Header.Get(identity.HeaderExecutionID); execID != "" {
 		ctx = xctx.WithExecutionID(ctx, execID)
 	}
 

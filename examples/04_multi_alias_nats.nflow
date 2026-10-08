@@ -1,0 +1,30 @@
+@description "Test izolacji transportu: 1 adres NATS, 3 aliasy, 3 niezależne instancje w pamięci"
+
+# Wczytujemy 3 instancje transportu NATS.
+# Obecnie wszystkie uderzają w domyślny 127.0.0.1:4222, ale każda z nich
+# może w przyszłości dostać inny url, creds_file, czy timeout.
+@require github.com/nexssp/transportnats/nexssflow as tenant_a { url: "nats://127.0.0.1:4222" }
+@require github.com/nexssp/transportnats/nexssflow as tenant_b { url: "nats://127.0.0.1:4222" }
+@require github.com/nexssp/transportnats/nexssflow as system_c { url: "nats://127.0.0.1:4222" }
+
+# Definiujemy 3 niezależne pipeline'y RPC. Zauważ, że modyfikator :nats_request
+# nie jest tu powiązany z żadnym aliasem. Pipeline to czysta logika.
+@pipeline handler_a :nats_request="tenant.a.ping"
+  { source: "Tenant A", received_payload: . }
+@end
+
+@pipeline handler_b :nats_request="tenant.b.ping"
+  { source: "Tenant B", received_payload: . }
+@end
+
+@pipeline handler_c :nats_request="system.c.ping"
+  { source: "System C", received_payload: . }
+@end
+
+# Uruchamiamy 3 klienty NATS równolegle (blokując wątek główny).
+# Jawnie przekazujemy argument `endpoints`, wyłączając auto-discovery.
+parallel {
+  worker_a: tenant_a.listen @{ endpoints: ["pipeline.handler_a"] },
+  worker_b: tenant_b.listen @{ endpoints: ["pipeline.handler_b"] },
+  worker_c: system_c.listen @{ endpoints: ["pipeline.handler_c"] }
+}

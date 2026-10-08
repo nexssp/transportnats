@@ -1,0 +1,15 @@
+@description "Standardized NATS Microservice API with built-in discovery"
+
+@require github.com/nexssp/transportnats/nexssflow { url: "nats://127.0.0.1:4222" }
+
+# Modifer format: service_name:version:endpoint_name:subject
+@pipeline fraud_check :nats_micro="FraudService:1.2.0:CheckTransaction:ops.fraud.check"
+
+  # Fast, synchronous RPC responder logic
+  match(.amount > 10000) {
+    true -> { allowed: false, risk_score: 99, reason: "Amount exceeds safe threshold" },
+    default -> { allowed: true, risk_score: 12, reason: "Normal" }
+  }
+@end
+
+nats.listen

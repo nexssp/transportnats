@@ -8,29 +8,28 @@ import (
 )
 
 func (t *Transport) Publish(ctx context.Context, subject string, payload any) error {
-	nc := t.Conn()
-	if nc == nil {
-		return xerr.Unavailable("nats: connection not ready")
-	}
-
-	data, err := t.codec.Marshal(payload)
+	nc, err := t.EnsureConn(ctx)
 	if err != nil {
-		return xerr.Internal("failed to marshal nats payload", err)
+		return err
 	}
 
-	msg := nats.NewMsg(subject)
-	msg.Data = data
-	injectContextHeaders(ctx, msg)
-
-	if pubErr := nc.PublishMsg(msg); pubErr != nil {
-		return MapError(pubErr)
+	body, err := t.codec.Marshal(payload)
+	if err != nil {
+		return xerr.Internal("nats: marshal payload", err)
 	}
 
-	return nil
+	msg := &nats.Msg{Subject: subject, Data: body}
+	propagateToMsg(ctx, msg)
+
+	return nc.PublishMsg(msg)
 }
 
 func (t *Transport) PublishDurable(ctx context.Context, binding DurableBinding, payload any) error {
 	if err := validateDurableBinding(binding); err != nil {
+		return err
+	}
+
+	if _, err := t.EnsureConn(ctx); err != nil {
 		return err
 	}
 
@@ -44,7 +43,6 @@ func (t *Transport) PublishDurable(ctx context.Context, binding DurableBinding, 
 		if infraErr := t.ensureDurableInfra(js, binding); infraErr != nil {
 			return infraErr
 		}
-
 		t.verifiedStreams.Store(cacheKey, struct{}{})
 	}
 
@@ -65,9 +63,9 @@ func (t *Transport) PublishDurable(ctx context.Context, binding DurableBinding, 
 }
 
 func (t *Transport) Request(ctx context.Context, subject string, payload, resPtr any) error {
-	nc := t.Conn()
-	if nc == nil {
-		return xerr.Unavailable("nats: connection not ready")
+	nc, err := t.EnsureConn(ctx)
+	if err != nil {
+		return err
 	}
 
 	data, err := t.codec.Marshal(payload)
@@ -91,7 +89,6 @@ func (t *Transport) Request(ctx context.Context, subject string, payload, resPtr
 				return appErr
 			}
 		}
-
 		return xerr.Internal("remote nats action error: " + string(resMsg.Data))
 	}
 

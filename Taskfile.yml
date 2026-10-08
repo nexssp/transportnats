@@ -1,0 +1,47 @@
+version: '3'
+
+vars:
+  GO_FILES:
+    sh: find . -type f -name '*.go' -not -path "./vendor/*"
+
+tasks:
+  default:
+    desc: "Run tests and linter"
+    cmds:
+      - task: lint
+      - task: test
+
+  test:
+    desc: "Run unit and contract tests with race detector"
+    cmds:
+      - go test -race -v -coverprofile=coverage.out ./tnats/... ./nexssflow/...
+
+  test:contract:
+    desc: "Run embedded server contract tests"
+    cmds:
+      - go test -v -run TestContract ./...
+
+  bench:
+    desc: "Run allocation and throughput benchmarks"
+    cmds:
+      - go test -benchmem -bench=. ./tnats/...
+
+  lint:
+    desc: "Run golangci-lint"
+    cmds:
+      - golangci-lint run --timeout 5m
+
+  examples:
+    desc: "Build all NATS example executables"
+    cmds:
+      - go build -o /dev/null ./examples/01_pubsub_and_request_reply/main.go
+      - go build -o /dev/null ./examples/02_jetstream_durable_work/main.go
+      - go build -o /dev/null ./examples/03_four_microservices/main.go
+      - go build -o /dev/null ./examples/04_objectstore_and_kv/main.go
+      - go build -o /dev/null ./examples/05_intensive_agent_mesh/main.go
+
+  clean:
+    desc: "Remove test artifacts and caches"
+    cmds:
+      - rm -f coverage.out coverage.html
+      - go clean -testcache

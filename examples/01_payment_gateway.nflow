@@ -1,0 +1,35 @@
+@description "Idempotent, high-throughput Payment Gateway RPC"
+
+@require github.com/nexssp/transportnats/nexssflow { url: "tls://nats.internal:4222", creds_file: "/vault/secrets/nats.creds" }
+
+@schema PaymentRequest struct {
+    ReferenceID string  `json:"reference_id" validate:"required"`
+    Amount      float64 `json:"amount"       validate:"required,gt=0"`
+    Currency    string  `json:"currency"     validate:"required,len=3"`
+}
+
+# Profile protects against double-charges via Idempotency.
+# A retried request with the same ReferenceID will instantly return the cached success response.
+@profile payment_critical :timeout=5s :concurrency=1000 :idempotency="ttl=24h key=.reference_id"
+
+@pipeline charge_card :profile=payment_critical :nats_request="payments.charge"
+  # 1. Validate payload against strict schema
+  schema.validate @{ name: "PaymentRequest" } ->
+
+  # 2. Fast-fail business logic
+  assert(.currency in ["USD", "EUR", "PLN"], "Unsupported currency") ->
+
+  # 3. Simulate processing (e.g., HTTP call to a bank)
+  { status: "SUCCESS", transaction_id: runtime.uuid, charged: .amount, ref: .reference_id } ->
+
+  # 4. Asynchronously emit an audit event to JetStream without blocking the RPC reply to the client
+  parallel {
+    reply: runtime.noop,
+    audit: { subject: "audit.payments", payload: . } -> nats.publish
+  } ->
+
+  # 5. Extract only the reply to send back over NATS RPC
+  .reply
+@end
+
+nats.listen

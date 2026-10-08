@@ -1,0 +1,32 @@
+@description "Synchronous NATS Microservice RPC for Token Verification (<1ms)"
+
+@require github.com/nexssp/transportnats/nexssflow { url: "nats://127.0.0.1:4222" }
+
+# Triggered by synchronous NATS request-reply calls to 'auth.verify'
+@pipeline verify_token :nats_request="auth.verify"
+  # Guard against missing or malformed tokens
+  assert(.token != nil, "Authorization token is missing") ->
+  assert(len(.token) >= 16, "Invalid token length") ->
+
+  # Verify token claims (in real world: decode JWT / verify signature)
+  {
+    valid: true,
+    user_id: "usr_94821",
+    roles: ["admin", "billing_manager"],
+    expires_in_sec: 3600
+  }
+@end
+
+# Secondary RPC endpoint: user profile lookup
+@pipeline get_user_profile :nats_request="users.get"
+  assert(.id != nil, "User id required") ->
+  {
+    id: .id,
+    name: "Maksymilian",
+    plan: "enterprise",
+    status: "active"
+  }
+@end
+
+# Starts the service and answers requests concurrently
+tnats.listen

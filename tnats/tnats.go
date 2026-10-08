@@ -62,6 +62,7 @@ type Transport struct {
 	workersWg            sync.WaitGroup
 	verifiedStreams      sync.Map
 	mu                   sync.RWMutex
+	connectMu            sync.Mutex
 	running              atomic.Bool
 }
 

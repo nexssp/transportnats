@@ -1,0 +1,23 @@
+@description "Multi-Cluster NATS: Isolated memory, independent connections"
+
+@require github.com/nexssp/transportnats/nexssflow as eu { url: "nats://127.0.0.1:4222" }
+@require github.com/nexssp/transportnats/nexssflow as us { url: "nats://127.0.0.1:4222" }
+@require github.com/nexssp/transportnats/nexssflow as ap { url: "nats://127.0.0.1:4222" }
+
+@pipeline handler_eu :nats_request="region.ping"
+  { region: "Europe", received: ., timestamp: "now", processing_node: runtime.env @{ name: "COMPUTERNAME" } }
+@end
+
+@pipeline handler_us :nats_request="region.ping"
+  { region: "North America", received: ., timestamp: "now", processing_node: runtime.env @{ name: "COMPUTERNAME" } }
+@end
+
+@pipeline handler_ap :nats_request="region.ping"
+  { region: "Asia Pacific", received: ., timestamp: "now", processing_node: runtime.env @{ name: "COMPUTERNAME" } }
+@end
+
+parallel {
+  eu_server: eu.listen @{ endpoints: ["pipeline.handler_eu"] },
+  us_server: us.listen @{ endpoints: ["pipeline.handler_us"] },
+  ap_server: ap.listen @{ endpoints: ["pipeline.handler_ap"] }
+}

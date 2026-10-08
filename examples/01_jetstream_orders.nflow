@@ -1,0 +1,29 @@
+@description "JetStream Worker: Stream Intake, Validation, and Auto Dead-Letter-Queue"
+
+@require github.com/nexssp/transportnats/nexssflow { url: "nats://127.0.0.1:4222" }
+
+# Pipeline runs automatically whenever a message arrives on ORDERS stream
+@pipeline process_order :durable="stream=ORDERS subject=orders.created durable=order_processor dlq=orders.dlq"
+  # 1. Enforce payload schema
+  assert(.order_id != nil, "Missing order_id") ->
+  assert(.amount > 0, "Amount must be strictly positive") ->
+
+  # 2. Enrich order data
+  {
+    ...,
+    processed_at: "now",
+    status: "CONFIRMED",
+    fee: .amount * 0.025
+  } ->
+
+  # 3. Log step and emit event to billing topic
+  log.info ->
+  {
+    subject: "billing.charge",
+    payload: { id: .order_id, total: .amount + .fee }
+  } ->
+  tnats.publish
+@end
+
+# Zero-boilerplate entrypoint: attaches to JetStream and serves requests
+tnats.listen

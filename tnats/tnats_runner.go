@@ -3,8 +3,6 @@ package tnats
 import (
 	"context"
 	"errors"
-	"fmt"
-	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nexssp/kernel/action"
@@ -13,6 +11,15 @@ import (
 	"github.com/nexssp/transport"
 )
 
+// Do runs the listener loop for every mounted binding and blocks until
+// the context is cancelled or the connection is permanently closed.
+//
+// The connection is dialed lazily through EnsureConn. A transport that
+// was constructed with a preexisting connection (FromConn) reuses it and
+// never dials. A transport built from a URL dials on the first Do call.
+//
+// Do is safe to call once per transport. Concurrent calls return an
+// error.
 func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 	if !t.running.CompareAndSwap(false, true) {
 		return nil, errors.New("nats transport is already running")
@@ -22,74 +29,42 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 	t.mu.RLock()
 	initErr := t.initErr
 	t.mu.RUnlock()
-
 	if initErr != nil {
 		t.signalReady(initErr)
-
 		return nil, initErr
 	}
 
 	if t.embedded != nil {
 		if err := t.startEmbedded(); err != nil {
 			t.signalReady(err)
-
 			return nil, err
 		}
 		defer t.stopEmbedded()
 	}
 
-	t.mu.RLock()
-	activeURL := t.url
-	t.mu.RUnlock()
+	runCtx, runCancel := context.WithCancel(ctx)
 
-	if activeURL == "" {
-		err := xerr.Internal("NATS URL is required")
+	nc, err := t.EnsureConn(runCtx)
+	if err != nil {
+		runCancel()
 		t.signalReady(err)
-
 		return nil, err
 	}
 
-	runCtx, runCancel := context.WithCancel(ctx)
-	defer runCancel()
-
-	opts := append([]nats.Option{
-		nats.RetryOnFailedConnect(true),
-		nats.MaxReconnects(-1),
-		nats.ReconnectBufSize(8 * 1024 * 1024),
-		nats.Timeout(3 * time.Second),
-	}, t.options...)
-
-	nc, err := nats.Connect(activeURL, opts...)
-	if err != nil {
-		connErr := MapError(err)
-		t.signalReady(connErr)
-
-		return nil, connErr
-	}
-
-	js, jsErr := nc.JetStream()
+	js, jsErr := t.ensureJetStream()
 	if jsErr != nil {
-		nc.Close()
-
-		mappedErr := MapError(jsErr)
-		t.signalReady(mappedErr)
-
-		return nil, mappedErr
+		runCancel()
+		t.signalReady(jsErr)
+		return nil, jsErr
 	}
-
-	t.mu.Lock()
-	t.conn = nc
-	t.js = js
-	t.mu.Unlock()
 
 	defer func() {
 		runCancel()
 
 		t.mu.Lock()
 		for _, svc := range t.microServices {
-			_ = svc.Stop() //nolint:errcheck // service stop on shutdown is best-effort
+			_ = svc.Stop() //nolint:errcheck // shutdown path
 		}
-
 		t.microServices = nil
 		t.mu.Unlock()
 
@@ -97,19 +72,12 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 		subs := t.subs
 		t.subs = nil
 		t.mu.Unlock()
-
 		for _, s := range subs {
-			_ = s.Unsubscribe() //nolint:errcheck // unsubscribe on shutdown is best-effort
+			_ = s.Unsubscribe() //nolint:errcheck // shutdown path
 		}
 
 		t.workersWg.Wait()
-
-		t.mu.Lock()
-		nc.Close()
-
-		t.conn = nil
-		t.js = nil
-		t.mu.Unlock()
+		_ = t.Close()
 	}()
 
 	t.mu.RLock()
@@ -118,7 +86,6 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 
 	if mountErr := t.mountActions(runCtx, nc, js, actions); mountErr != nil {
 		t.signalReady(mountErr)
-
 		return nil, mountErr
 	}
 
@@ -128,24 +95,21 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 	if flushErr := nc.FlushWithContext(flushCtx); flushErr != nil {
 		mappedErr := MapError(flushErr)
 		t.signalReady(mappedErr)
-
 		return nil, mappedErr
 	}
 
 	t.signalReady(nil)
-	t.log.Info("nats_transport_started", "url", sanitizeURL(activeURL))
+	t.log.Info("nats_transport_started", "url", sanitizeURL(nc.ConnectedUrl()))
 
 	closedChan := nc.StatusChanged(nats.CLOSED)
 	select {
 	case <-runCtx.Done():
 		t.log.Info("nats_transport_shutting_down")
-
-		return nil, nil //nolint:nilnil // graceful shutdown: no result, no error
+		return nil, nil
 	case <-closedChan:
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, nil //nolint:nilnil // caller canceled ctx: no result, no error
+			return nil, nil
 		}
-
 		return nil, xerr.Unavailable("nats: connection closed", nc.LastError())
 	}
 }
@@ -181,7 +145,7 @@ func (t *Transport) mountActions(
 			case ServiceBinding:
 				continue
 			default:
-				t.log.Warn("skipping_unsupported_binding", "binding", fmt.Sprint(b))
+				t.log.Warn("skipping_unsupported_binding", "binding", binding)
 			}
 
 			if err != nil {
@@ -212,7 +176,6 @@ func (t *Transport) subscribeTopic(
 				if len(m.Data) == 0 {
 					return nil
 				}
-
 				return t.codec.Unmarshal(m.Data, v)
 			}
 
@@ -238,16 +201,13 @@ func (t *Transport) subscribeTopic(
 
 			if m.Reply != "" {
 				reply := nats.NewMsg(m.Reply)
-
 				reply.Data = replyBytes
 				if scope.RequestID != "" {
 					reply.Header.Set(transport.HeaderRequestID, scope.RequestID)
 				}
-
 				if err != nil {
 					reply.Header.Set(HeaderErrorMarker, "1")
 				}
-
 				_ = nc.PublishMsg(reply) //nolint:errcheck // reply is best-effort; failure surfaces as requester timeout
 			} else if err != nil {
 				t.log.Error("nats_topic_action_failed", "subject", m.Subject, "error", err)
@@ -266,6 +226,29 @@ func (t *Transport) subscribeTopic(
 		sub, err = nc.Subscribe(b.Subject, handler)
 	}
 
+	if err != nil {
+		return MapError(err)
+	}
+
+	t.mu.Lock()
+	t.subs = append(t.subs, sub)
+	t.mu.Unlock()
+
+	return nil
+}
+
+func (t *Transport) dispatchSubscription(
+	nc *nats.Conn,
+	subject string,
+	act action.AnyAction,
+) error {
+	sub, err := nc.Subscribe(subject, func(msg *nats.Msg) {
+		ctx := populateFromMsg(msg)
+		if _, execErr := action.InvokeAny(ctx, act, msg.Data); execErr != nil {
+			t.log.Error("nats_dispatch_action_failed",
+				"subject", msg.Subject, "error", execErr)
+		}
+	})
 	if err != nil {
 		return MapError(err)
 	}

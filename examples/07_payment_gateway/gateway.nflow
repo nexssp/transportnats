@@ -1,0 +1,29 @@
+@description "Idempotent Payment Gateway RPC"
+
+@require github.com/nexssp/transportnats/nexssflow { url: "nats://127.0.0.1:4222" }
+
+@schema PaymentRequest struct {
+    ReferenceID string  `json:"reference_id" validate:"required"`
+    Amount      float64 `json:"amount"       validate:"required,gt=0"`
+    Currency    string  `json:"currency"     validate:"required,len=3"`
+}
+
+# Prevents double charges on client retries via KV-backed idempotency
+@profile payment_critical :timeout=5s :concurrency=1000 :idempotency="ttl=24h key=.reference_id"
+
+@pipeline charge_card :profile=payment_critical :nats_request="payments.charge"
+  schema.validate @{ name: "PaymentRequest" } ->
+  assert(.currency in ["USD", "EUR", "PLN"], "Unsupported currency") ->
+
+  { status: "SUCCESS", transaction_id: runtime.uuid, charged: .amount, ref: .reference_id } ->
+
+  # Emit audit event asynchronously, return response immediately
+  parallel {
+    reply: runtime.noop,
+    audit: { subject: "audit.payments", payload: . } -> nats.publish
+  } ->
+
+  .reply
+@end
+
+nats.listen

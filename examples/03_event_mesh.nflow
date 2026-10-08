@@ -1,0 +1,23 @@
+@description "High-Throughput Queue Group Consumer with Anomaly Detection"
+
+@require github.com/nexssp/transportnats/nexssflow { url: "nats://127.0.0.1:4222" }
+
+# Load balanced across multiple replica instances via Queue Group 'anomaly_detector'
+@pipeline ingest_telemetry :nats_queue="telemetry.v1 anomaly_detector"
+  # 1. Filter out keepalive pings immediately
+  assert(.type != "ping", "Ignore heartbeat pings") ? on_error {
+    else -> runtime.noop
+  } ->
+
+  # 2. Check for anomaly condition
+  match(.metric > 90.0) {
+    true -> {
+      subject: "alerts.critical",
+      payload: { sensor: .sensor_id, value: .metric, level: "CRITICAL" }
+    } -> tnats.publish,
+
+    default -> runtime.noop
+  }
+@end
+
+tnats.listen
