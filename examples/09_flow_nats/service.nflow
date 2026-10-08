@@ -1,0 +1,24 @@
+@description "🌀 Nexss Flow catalog quote RPC service"
+
+@schema QuoteRequest struct {
+    SKU      string `json:"sku"      validate:"required"`
+    Quantity int    `json:"quantity" validate:"required"`
+}
+
+@profile quote_endpoint :timeout=3s :concurrency=64
+
+@pipeline catalog_quote :profile=quote_endpoint :nats_request="catalog.quote"
+  schema.validate @{ name: "QuoteRequest" } ->
+  assert(.quantity >= 1, "quantity must be at least 1") ->
+  assert(.quantity <= 100, "quantity must be 100 or less") ->
+  {
+    sku: .sku,
+    quantity: .quantity,
+    currency: "USD",
+    unit_price_cents: 1299,
+    total_price_cents: 1299 * .quantity
+  }
+@end
+
+# Mount Flow pipelines that declare a NATS binding, then block until shutdown.
+nats.listen

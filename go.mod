@@ -6,9 +6,9 @@ require (
 	github.com/nats-io/nats-server/v2 v2.15.0
 	github.com/nats-io/nats.go v1.54.0
 	github.com/nats-io/nkeys v0.4.16
-	github.com/nexssp/flow v0.17.1
+	github.com/nexssp/flow v0.20.3
 	github.com/nexssp/kernel v0.27.4
-	github.com/nexssp/transport v0.3.2
+	github.com/nexssp/transport v0.4.0
 )
 
 require (
@@ -25,6 +25,7 @@ require (
 	github.com/nats-io/jwt/v2 v2.8.2 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/nexssp/validation v0.2.4 // indirect
+	github.com/tetratelabs/wazero v1.12.0 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect

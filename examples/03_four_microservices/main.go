@@ -76,7 +76,7 @@ func main() {
 	orderTr.Mount([]action.AnyAction{BuildOrderService(orderTr, logger)})
 	inventoryTr.Mount([]action.AnyAction{BuildInventoryService(inventoryTr, logger)})
 	paymentTr.Mount([]action.AnyAction{BuildPaymentService(paymentTr, logger)})
-	fulfillmentTr.Mount([]action.AnyAction{BuildFulfillmentService(fulfillmentTr, func() {
+	fulfillmentTr.Mount([]action.AnyAction{BuildFulfillmentService(func() {
 		completedPipelines.Add(1)
 	}, logger)})
 
@@ -86,20 +86,47 @@ func main() {
 	startService(ctx, &wg, paymentTr, "PaymentService", logger)
 	startService(ctx, &wg, fulfillmentTr, "FulfillmentService", logger)
 
-	_ = orderTr.WaitReady(ctx)
-	_ = inventoryTr.WaitReady(ctx)
-	_ = paymentTr.WaitReady(ctx)
-	_ = fulfillmentTr.WaitReady(ctx)
+	for _, service := range []struct {
+		name      string
+		transport *tnats.Transport
+	}{
+		{name: "OrderService", transport: orderTr},
+		{name: "InventoryService", transport: inventoryTr},
+		{name: "PaymentService", transport: paymentTr},
+		{name: "FulfillmentService", transport: fulfillmentTr},
+	} {
+		if err := service.transport.WaitReady(ctx); err != nil {
+			logger.Error("Microservice failed to become ready", "service", service.name, "error", err)
+			stop()
+			wg.Wait()
+
+			return
+		}
+	}
 
 	logger.Info(">>> 4 Microservices connected and ready. Starting order generation...")
 
 	// 3. Client Simulation: Submit 5 orders via RPC
 	clientTr := tnats.New(natsURL)
 
-	clientCtx, clientCancel := context.WithCancel(context.Background())
-	go func() { _, _ = clientTr.Do(clientCtx, nil) }()
+	clientCtx, clientCancel := context.WithCancel(ctx)
+	clientDone := make(chan error, 1)
+	go func() {
+		_, err := clientTr.Do(clientCtx, nil)
+		clientDone <- err
+	}()
 
-	_ = clientTr.WaitReady(ctx)
+	if err := clientTr.WaitReady(ctx); err != nil {
+		logger.Error("Client transport failed to become ready", "error", err)
+		clientCancel()
+		if clientErr := <-clientDone; clientErr != nil && !errors.Is(clientErr, context.Canceled) {
+			logger.Error("Client transport stopped", "error", clientErr)
+		}
+		stop()
+		wg.Wait()
+
+		return
+	}
 
 	const totalOrders = 5
 	for i := 1; i <= totalOrders; i++ {
@@ -113,8 +140,8 @@ func main() {
 		}
 
 		// Inject trace headers for distributed tracing verification
-		traceCtx := action.WithTraceContext(ctx, fmt.Sprintf("trace-%s", orderID), "span-root")
-		traceCtx = xctx.WithRequestID(traceCtx, fmt.Sprintf("req-%s", orderID))
+		traceCtx := action.WithTraceContext(ctx, "trace-"+orderID, "span-root")
+		traceCtx = xctx.WithRequestID(traceCtx, "req-"+orderID)
 
 		var res CreateOrderRes
 
@@ -143,20 +170,20 @@ func main() {
 
 	// 5. Clean, zero-leak shutdown
 	clientCancel()
+	if err := <-clientDone; err != nil && !errors.Is(err, context.Canceled) {
+		logger.Error("Client transport stopped", "error", err)
+	}
 	stop()
 	wg.Wait()
 	logger.Info("All microservices and broker shut down cleanly. Zero leaks.")
 }
 
 func startService(ctx context.Context, wg *sync.WaitGroup, tr *tnats.Transport, name string, log *slog.Logger) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		if _, err := tr.Do(ctx, nil); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error("Service error", "service", name, "error", err)
 		}
-	}()
+	})
 }
 
 func initCommerceStreams(js nats.JetStreamContext, log *slog.Logger) {

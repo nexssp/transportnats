@@ -27,15 +27,16 @@ linters:
     - noctx
     - errname
 
-    # === Security ===
+    # === Security & Dependencies ===
     - gosec
+    - depguard
     - asciicheck
     - bidichk
 
     # === Performance & modern Go ===
     - gocritic
     - dupl
-    - prealloc
+    # - prealloc  # Disabled to reduce noise unless strict performance is required
     - perfsprint
     - modernize
     - usestdlibvars
@@ -44,6 +45,7 @@ linters:
     - intrange
     - durationcheck
     - makezero
+    - exptostd
 
     # === Code quality & style ===
     - revive
@@ -63,14 +65,11 @@ linters:
     - rowserrcheck
     - sqlclosecheck
 
-    # === Optional: enable if you use these libraries ===
-    # - testifylint
-    # - paralleltest
-    # - tparallel
-    # - testableexamples
-    # - testpackage
-    # - loggercheck
-    # - sloglint
+    # === Test & Logging (Prod essentials) ===
+    - tparallel
+    - loggercheck
+    - sloglint
+    - testifylint
 
   settings:
     gocritic:
@@ -123,11 +122,11 @@ linters:
         - name: redefines-builtin-id
 
     gocyclo:
-      min-complexity: 15
+      min-complexity: 20  # Bumped from 15 to prevent over-refactoring of readable functions
 
     goconst:
-      min-len: 3
-      min-occurrences: 3
+      min-len: 5         # Bumped from 3 to reduce noise on short common strings
+      min-occurrences: 4 # Bumped from 3 to reduce noise on short common strings
       ignore-tests: true
 
     misspell:
@@ -151,19 +150,34 @@ linters:
       sprintf1: true
       strconcat: true
 
-    # Optional: enable and customize if needed
-    # depguard:
-    #   rules:
-    #     main:
-    #       deny:
-    #         - pkg: "github.com/pkg/errors"
-    #           desc: "Use standard library errors / fmt"
-    #         - pkg: "io/ioutil"
-    #           desc: "Use os / io"
-    #         - pkg: "math/rand$"
-    #           desc: "Use math/rand/v2"
-    #         - pkg: "log$"
-    #           desc: "Prefer log/slog"
+    depguard:
+      rules:
+        main:
+          deny:
+            # 1. Standardization
+            - pkg: "github.com/pkg/errors"
+              desc: "Use standard library 'errors' and 'fmt.Errorf' with %w"
+            - pkg: "io/ioutil"
+              desc: "Deprecated in Go 1.16. Use 'io' or 'os' instead"
+            # 2. Modern Go Features
+            - pkg: "math/rand$"
+              desc: "Use 'math/rand/v2' for better performance and security"
+            - pkg: "log$"
+              desc: "Prefer structured logging with 'log/slog'"
+            # 3. Critical for Large Prod Projects (Security & Maintenance)
+            - pkg: "github.com/satori/go.uuid"
+              desc: "Unmaintained. Use 'github.com/google/uuid' instead"
+            - pkg: "github.com/dgrijalva/jwt-go"
+              desc: "Has known CVEs. Use 'github.com/golang-jwt/jwt/v5'"
+            - pkg: "github.com/golang/protobuf"
+              desc: "Use the new 'google.golang.org/protobuf' API"
+
+    loggercheck:
+      kitlog: false
+      klog: false
+      logr: false
+      slog: true
+      zap: true
 
   exclusions:
     generated: strict
@@ -177,20 +191,37 @@ linters:
       - path: _test\.go
         linters:
           - dupl
-          - prealloc
           - nilnil
           - goconst
           - gocyclo
           - errcheck
           - unparam
+          # prealloc removed as it is globally disabled
 
       - path: _test\.go
         text: '^shadow: declaration of "err"'
         linters:
           - govet
 
-    paths:
-      - examples
+      - path: cli/completion\.go
+        text: "G101"
+        linters:
+          - gosec
+
+      - path: cli/harness_smoke_test\.go
+        text: "G204"
+        linters:
+          - gosec
+
+      - path: cli/require\.go
+        text: "G204"
+        linters:
+          - gosec
+
+      - path: cli/selfbuild\.go
+        text: "G204"
+        linters:
+          - gosec
 
 formatters:
   enable:
@@ -198,7 +229,8 @@ formatters:
     - goimports
   settings:
     gofumpt:
-      # extra-rules: true   # enable for even stricter formatting
+      extra:
+        group-params: true
     goimports:
-      # local-prefixes:
-      #   - github.com/your/org/project
+      local-prefixes:
+        - github.com/nexssp/flow

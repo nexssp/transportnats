@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"time"
@@ -30,7 +31,7 @@ func main() {
 
 	paymentAction := action.New(
 		"payments.durable.process",
-		func(ctx context.Context, task PaymentTask) (string, error) {
+		func(_ context.Context, task PaymentTask) (string, error) {
 			fmt.Printf("💳 Processing payment of $%.2f for %s\n", task.Amount, task.AccountID)
 
 			return "PROCESSED", nil
@@ -41,8 +42,8 @@ func main() {
 	transport.Mount([]action.AnyAction{paymentAction})
 
 	go func() {
-		if _, err := transport.Do(ctx, nil); err != nil {
-			log.Printf("JetStream transport error: %v", err)
+		if _, err := transport.Do(ctx, nil); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("JetStream transport stopped", "error", err)
 		}
 	}()
 

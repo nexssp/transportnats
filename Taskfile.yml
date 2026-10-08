@@ -1,47 +1,83 @@
 version: '3'
 
-vars:
-  GO_FILES:
-    sh: find . -type f -name '*.go' -not -path "./vendor/*"
-
 tasks:
   default:
-    desc: "Run tests and linter"
+    desc: Show every available task
     cmds:
-      - task: lint
-      - task: test
+      - task --list
+
+  build:
+    desc: Build every Go package
+    cmds:
+      - go build ./...
 
   test:
-    desc: "Run unit and contract tests with race detector"
+    desc: Fast short tests without the race detector
     cmds:
-      - go test -race -v -coverprofile=coverage.out ./tnats/... ./nexssflow/...
+      - go test -short -count=1 ./...
+
+  test:race:
+    desc: Run the full test suite with the race detector
+    cmds:
+      - go test -race -count=1 ./...
 
   test:contract:
-    desc: "Run embedded server contract tests"
+    desc: Run embedded NATS and Flow integration tests
     cmds:
-      - go test -v -run TestContract ./...
+      - go test -count=1 -v -run '^(TestTNATS_EmbeddedServer_Integration|TestFlowNATSServiceRequestAndShutdown)$' ./...
+
+  test:short:
+    desc: Alias for the short test suite
+    cmds:
+      - task: test
 
   bench:
-    desc: "Run allocation and throughput benchmarks"
+    desc: Run allocation and throughput benchmarks
     cmds:
-      - go test -benchmem -bench=. ./tnats/...
+      - go test ./tnats/... -run '^$' -bench=. -benchmem
+
+  fmt:
+    desc: Apply configured gofumpt and goimports formatters
+    cmds:
+      - golangci-lint fmt
+
+  fmt:check:
+    desc: Check configured formatting without editing files
+    cmds:
+      - golangci-lint fmt --diff
 
   lint:
-    desc: "Run golangci-lint"
+    desc: Run configured golangci-lint checks
     cmds:
-      - golangci-lint run --timeout 5m
+      - golangci-lint run ./...
+
+  vet:
+    desc: Run go vet across all packages
+    cmds:
+      - go vet ./...
 
   examples:
-    desc: "Build all NATS example executables"
+    desc: Build all NATS example executables
     cmds:
-      - go build -o /dev/null ./examples/01_pubsub_and_request_reply/main.go
-      - go build -o /dev/null ./examples/02_jetstream_durable_work/main.go
-      - go build -o /dev/null ./examples/03_four_microservices/main.go
-      - go build -o /dev/null ./examples/04_objectstore_and_kv/main.go
-      - go build -o /dev/null ./examples/05_intensive_agent_mesh/main.go
+      - go build -o /dev/null ./examples/00_quickstart
+      - go build -o /dev/null ./examples/01_pubsub_and_request_reply
+      - go build -o /dev/null ./examples/02_jetstream_durable_work
+      - go build -o /dev/null ./examples/03_four_microservices
+      - go build -o /dev/null ./examples/04_objectstore_and_kv
+      - go build -o /dev/null ./examples/05_intensive_agent_mesh
+      - go build -o /dev/null ./examples/09_flow_nats
+
+  check:
+    desc: "Full local quality gate: format, lint, vet, race tests, and examples"
+    cmds:
+      - task: fmt:check
+      - task: lint
+      - task: vet
+      - task: test:race
+      - task: examples
 
   clean:
-    desc: "Remove test artifacts and caches"
+    desc: Remove test artifacts and caches
     cmds:
       - rm -f coverage.out coverage.html
       - go clean -testcache

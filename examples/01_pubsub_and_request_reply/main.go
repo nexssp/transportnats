@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"time"
@@ -25,7 +26,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	inventoryAction := action.New("inventory.check", func(ctx context.Context, req InventoryReq) (InventoryRes, error) {
+	inventoryAction := action.New("inventory.check", func(_ context.Context, req InventoryReq) (InventoryRes, error) {
 		fmt.Printf("📦 Checking inventory for SKU: %s (Qty: %d)\n", req.SKU, req.Qty)
 
 		return InventoryRes{Available: req.Qty <= 100}, nil
@@ -38,8 +39,8 @@ func main() {
 	transport.Mount([]action.AnyAction{inventoryAction})
 
 	go func() {
-		if _, err := transport.Do(ctx, nil); err != nil {
-			log.Printf("Transport error: %v", err)
+		if _, err := transport.Do(ctx, nil); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("NATS transport stopped", "error", err)
 		}
 	}()
 

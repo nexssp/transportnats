@@ -8,10 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nexssp/flow/contracts"
-	"github.com/nexssp/flow/core"
+	"github.com/nats-io/nats.go"
 	"github.com/nexssp/kernel/action"
 	"github.com/nexssp/kernel/xerr"
+
+	"github.com/nexssp/flow/contracts"
+	"github.com/nexssp/flow/core"
 
 	"github.com/nexssp/transportnats/tnats"
 )
@@ -22,12 +24,17 @@ func init() {
 	core.Register(ID, Bundle)
 }
 
+// Config controls one Flow-owned NATS transport instance.
 type Config struct {
-	URL       string        `flow:"url"        default:"nats://127.0.0.1:4222"`
-	Name      string        `flow:"name"       default:"nflow-client"`
-	Timeout   time.Duration `flow:"timeout"    default:"5s"`
-	CredsFile string        `flow:"creds_file"`
-	Token     string        `flow:"token"`
+	URL            string        `flow:"url"              default:"nats://127.0.0.1:4222"`
+	Name           string        `flow:"name"             default:"nflow-client"`
+	Timeout        time.Duration `flow:"timeout"          default:"5s"`
+	CredsFile      string        `flow:"creds_file"`
+	Token          string        `flow:"token"`
+	RootCAFile     string        `flow:"root_ca_file"`
+	ClientCertFile string        `flow:"client_cert_file"`
+	ClientKeyFile  string        `flow:"client_key_file"`
+	Production     bool          `flow:"production"`
 }
 
 func Bundle(rawOpts map[string]string) core.Bundle {
@@ -36,18 +43,59 @@ func Bundle(rawOpts map[string]string) core.Bundle {
 		panic("transportnats bundle: " + err.Error())
 	}
 
-	var opts []tnats.Option
-	if cfg.CredsFile != "" {
-		opts = append(opts, tnats.WithJWT(cfg.CredsFile))
+	bundle, err := NewBundle(cfg)
+	if err != nil {
+		panic("transportnats bundle: " + err.Error())
 	}
-	if cfg.Token != "" {
-		opts = append(opts, tnats.WithToken(cfg.Token))
+	return bundle
+}
+
+// NewBundle builds a configured Flow extension and returns configuration
+// errors instead of panicking. Production mode validates TLS and credentials
+// before the transport can be used.
+func NewBundle(cfg Config) (core.Bundle, error) {
+	if cfg.URL == "" {
+		cfg.URL = "nats://127.0.0.1:4222"
 	}
-	if len(opts) == 0 {
-		opts = append(opts, tnats.WithNATSOptions())
+	if cfg.Name == "" {
+		cfg.Name = "nflow-client"
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 5 * time.Second
+	}
+	if cfg.CredsFile != "" && cfg.Token != "" {
+		return core.Bundle{}, errors.New("configure only one of creds_file or token")
+	}
+	if (cfg.ClientCertFile == "") != (cfg.ClientKeyFile == "") {
+		return core.Bundle{}, errors.New("client_cert_file and client_key_file must be configured together")
+	}
+
+	opts := []tnats.Option{tnats.WithNATSOptions(nats.Name(cfg.Name))}
+	if cfg.Production {
+		opts = append(opts, tnats.WithProductionSecurity(tnats.ProductionSecurity{
+			RootCAFile:      cfg.RootCAFile,
+			CredentialsFile: cfg.CredsFile,
+			ClientCertFile:  cfg.ClientCertFile,
+			ClientKeyFile:   cfg.ClientKeyFile,
+		}))
+	} else {
+		if cfg.CredsFile != "" {
+			opts = append(opts, tnats.WithJWT(cfg.CredsFile))
+		}
+		if cfg.Token != "" {
+			opts = append(opts, tnats.WithToken(cfg.Token))
+		}
+		if cfg.RootCAFile != "" || cfg.ClientCertFile != "" {
+			opts = append(opts, tnats.WithTLS(cfg.RootCAFile, cfg.ClientCertFile, cfg.ClientKeyFile))
+		}
 	}
 
 	tr := tnats.New(cfg.URL, opts...)
+	if cfg.Production {
+		if err := tr.ValidateProduction(); err != nil {
+			return core.Bundle{}, fmt.Errorf("validate production NATS settings: %w", err)
+		}
+	}
 
 	return core.Bundle{
 		ID:        ID,
@@ -58,7 +106,7 @@ func Bundle(rawOpts map[string]string) core.Bundle {
 				return tr.Close()
 			},
 		},
-	}
+	}, nil
 }
 
 func Library(tr *tnats.Transport, cfg Config) action.Library {
@@ -181,10 +229,32 @@ func listenAction(tr *tnats.Transport) action.AnyAction {
 		}
 
 		tr.Mount(actionsToMount)
-		if err := tr.WaitReady(ctx); err != nil {
+		runCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := tr.Do(runCtx, nil)
+			done <- err
+		}()
+
+		if err := tr.WaitReady(runCtx); err != nil {
+			cancel()
+			doErr := <-done
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return nil, nil
+			}
+			if doErr != nil {
+				return nil, xerr.Unavailable("nats.listen: transport failed to start", doErr)
+			}
 			return nil, xerr.Unavailable("nats.listen: timeout waiting for connection", err)
 		}
-		return tr.Do(ctx, nil)
+
+		err := <-done
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, nil
+		}
+		return nil, err
 	}).
 		Tag("transport", "nats").
 		Build()

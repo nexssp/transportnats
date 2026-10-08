@@ -116,12 +116,12 @@ func BuildPaymentService(paymentTr *tnats.Transport, logger *slog.Logger) action
 
 // BuildFulfillmentService dispatches physical items using a distributed QueueGroup
 // for competing consumer load balancing.
-func BuildFulfillmentService(fulfillmentTr *tnats.Transport, onComplete func(), logger *slog.Logger) action.AnyAction {
+func BuildFulfillmentService(onComplete func(), logger *slog.Logger) action.AnyAction {
 	return action.New("fulfillment.dispatch", func(ctx context.Context, ev PaymentSettledEvent) (string, error) {
 		// Simulate packaging, label generation, and logistics ERP dispatch
 		time.Sleep(30 * time.Millisecond)
 
-		trackingCode := fmt.Sprintf("TRACK-DHL-%s", ev.OrderID)
+		trackingCode := "TRACK-DHL-" + ev.OrderID
 		logger.Info("[FulfillmentService] Package dispatched to carrier",
 			"order_id", ev.OrderID,
 			"tx_id", ev.TxID,

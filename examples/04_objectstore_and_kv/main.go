@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -28,7 +29,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	storeDir, _ := os.MkdirTemp("", "nats_obj_kv_*")
+	storeDir, err := os.MkdirTemp("", "nats_obj_kv_*")
+	if err != nil {
+		logger.Error("temporary store directory creation failed", "error", err)
+
+		return
+	}
 	defer os.RemoveAll(storeDir)
 
 	// 1. Boot the broker first so infrastructure exists before actions mount.
@@ -67,13 +73,18 @@ func main() {
 		return
 	}
 
-	setupBuckets(bootstrapJS, logger)
+	if setupErr := setupBuckets(bootstrapJS); setupErr != nil {
+		bootstrapNC.Close()
+		logger.Error("JetStream bucket initialization failed", "error", setupErr)
+
+		return
+	}
 	bootstrapNC.Close()
 
 	tr := tnats.New(srv.ClientURL())
 
 	// 2. Action A: Dynamic Config Watcher (JetStream KV)
-	configAction := action.New("config.watch", func(ctx context.Context, cfg ConfigPayload) (string, error) {
+	configAction := action.New("config.watch", func(_ context.Context, cfg ConfigPayload) (string, error) {
 		logger.Info("[ConfigWatcher] Dynamic configuration updated",
 			"max_workers", cfg.MaxWorkers,
 			"log_level", cfg.LogLevel,
@@ -85,7 +96,7 @@ func main() {
 		Build()
 
 	// 3. Action B: ObjectStore Blob Ingestion Watcher (Large Files)
-	objectAction := action.New("objects.ingest", func(ctx context.Context, ev tnats.ObjectEvent) (string, error) {
+	objectAction := action.New("objects.ingest", func(_ context.Context, ev tnats.ObjectEvent) (string, error) {
 		logger.Info("[ObjectStoreWatcher] Object mutation detected",
 			"bucket", ev.Bucket,
 			"name", ev.Name,
@@ -125,10 +136,14 @@ func main() {
 
 	// 4. Update KV configuration dynamically
 	kv, err := js.KeyValue("DYNAMIC_CONFIGS")
-	if err == nil {
+	if err != nil {
+		logger.Error("KV bucket lookup failed", "error", err)
+	} else {
 		time.Sleep(100 * time.Millisecond)
 
-		_, _ = kv.Put("runtime.settings", []byte(`{"max_workers": 64, "log_level": "DEBUG"}`))
+		if _, err := kv.Put("runtime.settings", []byte(`{"max_workers": 64, "log_level": "DEBUG"}`)); err != nil {
+			logger.Error("KV configuration update failed", "error", err)
+		}
 	}
 
 	// 5. Upload binary blob to ObjectStore
@@ -162,15 +177,20 @@ func main() {
 	logger.Info("Shutdown demonstration completed cleanly.")
 }
 
-func setupBuckets(js nats.JetStreamContext, log *slog.Logger) {
-	_, _ = js.CreateKeyValue(&nats.KeyValueConfig{
+func setupBuckets(js nats.JetStreamContext) error {
+	if _, err := js.CreateKeyValue(&nats.KeyValueConfig{
 		Bucket:  "DYNAMIC_CONFIGS",
 		Storage: nats.MemoryStorage,
-	})
-	_, _ = js.CreateObjectStore(&nats.ObjectStoreConfig{
+	}); err != nil {
+		return fmt.Errorf("create KV bucket: %w", err)
+	}
+	if _, err := js.CreateObjectStore(&nats.ObjectStoreConfig{
 		Bucket:  "ASSETS_BUCKET",
 		Storage: nats.MemoryStorage,
-	})
+	}); err != nil {
+		return fmt.Errorf("create object store bucket: %w", err)
+	}
+	return nil
 }
 
 func previewLen(a, b int) int {

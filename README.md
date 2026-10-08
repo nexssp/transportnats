@@ -54,6 +54,7 @@ go get github.com/nexssp/transportnats
 Requirements:
 
 - Go `1.26+` as declared by `go.mod`;
+- Flow `v0.20.3` and Kernel `v0.27.4` as currently pinned and tested by this module;
 - NATS Server `2.10+` for the general feature set;
 - NATS Server `2.14+` is recommended for the complete tested feature set, including current multi-filter behavior;
 - JetStream enabled for durable work, consumers, KV, ObjectStore, or idempotency.
@@ -111,6 +112,104 @@ func main() {
 ```
 
 `Transport.Request` automatically serializes the request, propagates Kernel context headers, maps remote `xerr` responses back to application errors, and decodes the typed response.
+
+### Run the quickstart locally
+
+The self-contained example starts an embedded NATS broker, serves a typed Kernel action over request/reply, makes one request, and shuts down cleanly. It does not require a separate NATS installation:
+
+```bash
+go run ./examples/00_quickstart
+```
+
+Expected output:
+
+```text
+SKU SKU-42: available=true, remaining=9
+```
+
+## 🌀 Nexss Flow integration
+
+`github.com/nexssp/transportnats/nexssflow` connects [Nexss Flow](https://github.com/nexssp/flow) pipelines to this transport. Flow compiles `.nflow` source into Kernel actions; the NATS bundle adds NATS-bound actions (`nats.listen`, `nats.publish`, `nats.request`, and `nats.publish_durable`) plus routing modifiers. The business pipeline stays in Flow source while NATS connection, serialization, context headers, error mapping, and broker lifecycle remain in the transport adapter.
+
+### Start with the `.nflow` program
+
+The actual application example is [`examples/09_flow_nats/service.nflow`](examples/09_flow_nats/service.nflow). It defines the request schema, validation, quote pipeline, NATS request/reply subject, and listener. The Go file in that directory is only the runtime host that supplies production connection settings and lifecycle management; the business logic is in `.nflow`:
+
+```nflow
+@description "🌀 Nexss Flow catalog quote RPC service"
+
+@schema QuoteRequest struct {
+    SKU      string `json:"sku"      validate:"required"`
+    Quantity int    `json:"quantity" validate:"required"`
+}
+
+@profile quote_endpoint :timeout=3s :concurrency=64
+
+@pipeline catalog_quote :profile=quote_endpoint :nats_request="catalog.quote"
+  schema.validate @{ name: "QuoteRequest" } ->
+  assert(.quantity >= 1, "quantity must be at least 1") ->
+  assert(.quantity <= 100, "quantity must be 100 or less") ->
+  {
+    sku: .sku,
+    quantity: .quantity,
+    currency: "USD",
+    unit_price_cents: 1299,
+    total_price_cents: 1299 * .quantity
+  }
+@end
+
+# Mount Flow pipelines that declare a NATS binding, then block until shutdown.
+nats.listen
+```
+
+### Run the sample service
+
+The complete runnable example at [`examples/09_flow_nats`](examples/09_flow_nats/) embeds this exact `.nflow` source in a small Go host. It connects to an external TLS-authenticated NATS deployment, handles process signals, and transfers bundle cleanup to the Flow host. Its integration test exercises the Flow endpoint, validation, and shutdown against embedded NATS. This is an operational blueprint, not a substitute for service-specific permissions, business data, capacity testing, or production observability.
+
+Run it against a NATS deployment with TLS and a `.creds` identity:
+
+```bash
+export NATS_URL='tls://nats.example.net:4222'
+export NATS_CREDS_FILE='/run/secrets/catalog-service.creds'
+export NATS_ROOT_CA_FILE='/run/secrets/nats-root-ca.pem'
+# Optional mutual TLS; set both variables or neither.
+export NATS_CLIENT_CERT_FILE='/run/secrets/catalog-service.pem'
+export NATS_CLIENT_KEY_FILE='/run/secrets/catalog-service-key.pem'
+go run ./examples/09_flow_nats
+```
+
+The sample handles request/reply on `catalog.quote`. The `.nflow` program applies a per-process timeout and concurrency limit, checks the quantity range with explicit assertions, and computes a deterministic demonstration quote. Production mode checks the URL scheme, required credential/CA files, parses the root CA PEM, and verifies that optional mTLS paths are paired before dialing; NATS validates credentials and negotiates the TLS connection when dialing. Secrets stay in external files; they are never placed in Flow source or logged. Flow's current `schema.validate` checks required fields and coarse types, not numeric `gte`/`lte` tag constraints; the service deliberately makes its range rules explicit.
+
+When embedding Flow in another Go service, build the runtime from Flow's standard bundles plus exactly one configured NATS bundle, then transfer that bundle's cleanup callbacks to `runner.Host`:
+
+```go
+bundle, err := nexssflow.NewBundle(nexssflow.Config{
+    URL:        os.Getenv("NATS_URL"),
+    Name:       "catalog-quote",
+    CredsFile:  os.Getenv("NATS_CREDS_FILE"),
+    RootCAFile: os.Getenv("NATS_ROOT_CA_FILE"),
+    Production: true,
+})
+if err != nil {
+    return err
+}
+cfg, err := runner.BuildConfig(append(native.Bundles(), bundle))
+if err != nil {
+    return err
+}
+host := runner.NewHost()
+if err := host.Own(bundle); err != nil {
+    return err
+}
+return host.Run(ctx, func(ctx context.Context) error {
+    _, err := runner.Execute(ctx, cfg, source, "service.nflow", nil)
+    return err
+})
+```
+
+`NewBundle` returns configuration errors directly for Go hosts. Flow `@require` can also configure the extension; supported options are `url`, `name`, `timeout`, `creds_file`, `token`, `root_ca_file`, `client_cert_file`, `client_key_file`, and `production`. Set `production: true` to require validated TLS and credential files. Never put actual tokens, JWTs, credential contents, or private keys in checked-in `.nflow` files.
+
+Supported route modifiers include `:nats_request="subject"`, `:nats_topic="subject@queue"`, `:nats_durable="stream:subject:durable:dlq"`, `:nats_consumer="stream:subject:durable"`, `:nats_kv="bucket:key"`, `:nats_object="bucket:pattern"`, and `:nats_micro="service:version:endpoint:subject"`. `nats.listen` auto-discovers Flow actions carrying a NATS binding; it can also take an explicit endpoint list for narrower mounting. See the [Flow example runbook](examples/09_flow_nats/README.md) for lifecycle details, deployment checks, and the limits of Core NATS request/reply.
 
 ## Reliability semantics
 
@@ -313,11 +412,13 @@ The repository contains runnable examples under [`examples/`](examples/):
 
 | Example | Demonstrates | Production gap it intentionally leaves to the application |
 |---|---|---|
+| `00_quickstart` | Embedded NATS, typed Kernel action, request/reply, graceful shutdown | External broker provisioning and production authentication |
 | `01_pubsub_and_request_reply` | Kernel action routes, topic binding, queue group, RPC server | External NATS provisioning and a separate RPC client |
 | `02_jetstream_durable_work` | Durable stream, pull worker, ACK/NAK retry policy, DLQ configuration | Durable DB/outbox, DLQ monitoring, deployment migrations |
 | `03_four_microservices` | End-to-end choreography, tracing headers, idempotent order entry, durable consumers, competing workers | Real databases and external payment/logistics providers |
 | `04_objectstore_and_kv` | Embedded NATS, KV watcher, ObjectStore watcher, bounded blob data, put/get/delete | External storage policy, access control, retention, large-blob strategy |
 | `05_intensive_agent_mesh` | Seven transports, 100 jobs, request/reply validation, queue-group workers, event fanout, durable audit, idempotency, and trace propagation | Capacity planning, external persistence, multi-node failover, and real agent runtimes |
+| `09_flow_nats` | 🌀 Flow DSL to NATS RPC, schema validation, production TLS configuration, signal shutdown, bundle ownership | Real pricing data, broker-side permissions, deployment health/observability, and capacity tuning |
 
 The examples cover the principal public APIs, but they do **not** demonstrate every operational concern. In particular, there is no runnable certificate-generation environment, multi-node failover test, external observability backend, database transaction/outbox implementation, or production deployment manifest. Those belong in integration and deployment repositories rather than pretending a local demo proves them.
 
@@ -361,6 +462,17 @@ The suite uses embedded NATS servers and temporary JetStream stores. It covers:
 - shutdown and race safety.
 
 The benchmarks currently guarantee zero allocations only for the specific token-matching and header fast paths. Network and JetStream paths necessarily allocate and perform I/O.
+
+### Task runner
+
+The root `Taskfile.yml` provides optional shortcuts for the development checks. Install Task using the [official installation guide](https://taskfile.dev/docs/installation), then run these commands from the repository root:
+
+```bash
+task --list  # show available tasks; this is also what plain `task` does
+task check   # formatting, lint, vet, race tests, and example builds
+```
+
+The check requires Go 1.26+ and golangci-lint v2. Task is only a command runner; the underlying Go commands can also be run directly.
 
 ## Architecture
 

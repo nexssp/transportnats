@@ -12,7 +12,7 @@ import (
 )
 
 // Do runs the listener loop for every mounted binding and blocks until
-// the context is cancelled or the connection is permanently closed.
+// the context is canceled or the connection is permanently closed.
 //
 // The connection is dialed lazily through EnsureConn. A transport that
 // was constructed with a preexisting connection (FromConn) reuses it and
@@ -105,9 +105,11 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 	select {
 	case <-runCtx.Done():
 		t.log.Info("nats_transport_shutting_down")
+		//nolint:nilnil // Context cancellation is a successful stop; the listener has no result value.
 		return nil, nil
 	case <-closedChan:
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			//nolint:nilnil // Context cancellation is a successful stop; the listener has no result value.
 			return nil, nil
 		}
 		return nil, xerr.Unavailable("nats: connection closed", nc.LastError())
@@ -226,29 +228,6 @@ func (t *Transport) subscribeTopic(
 		sub, err = nc.Subscribe(b.Subject, handler)
 	}
 
-	if err != nil {
-		return MapError(err)
-	}
-
-	t.mu.Lock()
-	t.subs = append(t.subs, sub)
-	t.mu.Unlock()
-
-	return nil
-}
-
-func (t *Transport) dispatchSubscription(
-	nc *nats.Conn,
-	subject string,
-	act action.AnyAction,
-) error {
-	sub, err := nc.Subscribe(subject, func(msg *nats.Msg) {
-		ctx := populateFromMsg(msg)
-		if _, execErr := action.InvokeAny(ctx, act, msg.Data); execErr != nil {
-			t.log.Error("nats_dispatch_action_failed",
-				"subject", msg.Subject, "error", execErr)
-		}
-	})
 	if err != nil {
 		return MapError(err)
 	}

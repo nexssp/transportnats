@@ -109,7 +109,7 @@ func main() {
 	}).Route(tnats.Topic("mesh.command", "planner-workers")).Build()})
 
 	scheduler.Mount([]action.AnyAction{action.New(
-		"mesh.scheduler", func(ctx context.Context, cmd Command) (bool, error) {
+		"mesh.scheduler", func(_ context.Context, cmd Command) (bool, error) {
 			return cmd.JobID != "" && cmd.Agent != "", nil
 		}).Route(tnats.Request("mesh.scheduler.validate", 2*time.Second)).Build()})
 
@@ -134,14 +134,14 @@ func main() {
 	workerA.Mount([]action.AnyAction{workerAction("worker-a")})
 	workerB.Mount([]action.AnyAction{workerAction("worker-b")})
 
-	auditor.Mount([]action.AnyAction{action.New("mesh.audit", func(ctx context.Context, event Audit) (string, error) {
+	auditor.Mount([]action.AnyAction{action.New("mesh.audit", func(_ context.Context, event Audit) (string, error) {
 		logger.Info("audit event", "job_id", event.JobID, "agent", event.Agent)
 
 		return "audited", nil
 	}).Route(auditBinding).Build()})
 
 	collector.Mount([]action.AnyAction{action.New(
-		"mesh.collector", func(ctx context.Context, result Result) (string, error) {
+		"mesh.collector", func(_ context.Context, result Result) (string, error) {
 			count := completed.Add(1)
 			logger.Info("result collected", "job_id", result.JobID, "worker", result.Value, "completed", count)
 
