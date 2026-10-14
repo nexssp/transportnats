@@ -6,13 +6,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexssp/kernel/action"
-	"github.com/nexssp/transportnats/nexssflow"
-	"github.com/nexssp/transportnats/tnats"
-
-	"github.com/nexssp/flow/core"
+	"github.com/nexssp/flow/compiler"
 	"github.com/nexssp/flow/native"
 	"github.com/nexssp/flow/runner"
+	"github.com/nexssp/kernel/action"
+
+	"github.com/nexssp/transportnats/nexssflow"
+	"github.com/nexssp/transportnats/tnats"
 )
 
 func TestFlowNATSServiceRequestAndShutdown(t *testing.T) {
@@ -21,11 +21,11 @@ func TestFlowNATSServiceRequestAndShutdown(t *testing.T) {
 		NoLog:  true,
 		NoSigs: true,
 	}))
-	bundle := core.Bundle{
+	bundle := compiler.Bundle{
 		ID:        nexssflow.ID,
 		Libraries: []action.Library{nexssflow.Library(transport, nexssflow.Config{Timeout: time.Second})},
 		Modifiers: nexssflow.Modifiers(),
-		Shutdowns: []core.ShutdownFunc{func(context.Context) error { return transport.Close() }},
+		Shutdowns: []compiler.ShutdownFunc{func(context.Context) error { return transport.Close() }},
 	}
 	flowConfig, err := runner.BuildConfig(append(native.Bundles(), bundle))
 	if err != nil {

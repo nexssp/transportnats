@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexssp/transportnats/nexssflow"
-
 	"github.com/nexssp/flow/native"
 	"github.com/nexssp/flow/runner"
+
+	"github.com/nexssp/transportnats/nexssflow"
 )
 
 //go:embed service.nflow

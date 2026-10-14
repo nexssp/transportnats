@@ -1,83 +1,57 @@
+# Nexss Ecosystem
+# Copyright 2018-Present Marcin Polak and Contributors
+# SPDX-License-Identifier: Apache-2.0
 version: '3'
 
+vars:
+  BASE:
+    sh: git merge-base HEAD origin/main 2>/dev/null || echo HEAD
+  CENTRAL_REF: 'main'
+  PKG: '{{.CLI_ARGS | default "./..."}}'
+
 tasks:
-  default:
-    desc: Show every available task
-    cmds:
-      - task --list
+  default: { cmds: [task --list --sort none], silent: true }
 
-  build:
-    desc: Build every Go package
-    cmds:
-      - go build ./...
+  build:     { desc: "go build [./...]",                              cmds: ['go build {{.PKG}}'] }
+  build:bin: { desc: "go build -trimpath -o bin/ ./cmd/...",        cmds: [go build -trimpath -o bin/ ./cmd/...] }
+  tidy:      { desc: "go mod tidy",                                 cmds: [go mod tidy] }
+  clean:     { desc: "rm -rf bin coverage.out",                     cmds: [rm -rf bin coverage.out] }
 
-  test:
-    desc: Fast short tests without the race detector
-    cmds:
-      - go test -short -count=1 ./...
+  test:              { desc: "go tool gotestsum -- -short [./...]",         cmds: ['go tool gotestsum -- -short {{.PKG}}'] }
+  test:nocache:      { desc: "go tool gotestsum -- -count=1 [./...]",       cmds: ['go tool gotestsum -- -count=1 {{.PKG}}'] }
+  test:race:         { desc: "go tool gotestsum -- -race -short [./...]",   cmds: ['go tool gotestsum -- -race -short {{.PKG}}'] }
+  test:race:nocache: { desc: "go tool gotestsum -- -race -count=1 [./...]", cmds: ['go tool gotestsum -- -race -count=1 {{.PKG}}'] }
+  test:cover:        { desc: "go test -coverprofile=coverage.out [./...]",  cmds: ['go test -coverprofile=coverage.out -short {{.PKG}}', go tool cover -func=coverage.out] }
+  bench:             { desc: "go test -run='^$' -bench=. -benchmem [./...]",cmds: ["go test -run='^$' -bench=. -benchmem {{.PKG}}"] }
 
-  test:race:
-    desc: Run the full test suite with the race detector
-    cmds:
-      - go test -race -count=1 ./...
+  fmt:       { desc: "golangci-lint fmt", cmds: [golangci-lint fmt] }
+  lint:      { desc: "golangci-lint run", cmds: [golangci-lint run] }
+  lint:new:  { desc: 'golangci-lint run --new-from-rev="BASE"', cmds: ['golangci-lint run --new-from-rev="{{.BASE}}"'] }
+  lint:fix:  { desc: 'golangci-lint run --fix --new-from-rev="BASE"', cmds: ['golangci-lint run --fix --new-from-rev="{{.BASE}}"'] }
+  vuln:      { desc: "go tool govulncheck -show=version [./...]", cmds: ['go tool govulncheck -show=version {{.PKG}}'] }
 
-  test:contract:
-    desc: Run embedded NATS and Flow integration tests
-    cmds:
-      - go test -count=1 -v -run '^(TestTNATS_EmbeddedServer_Integration|TestFlowNATSServiceRequestAndShutdown)$' ./...
+  # ── Workflows (Gates) ────────────────────────────────────────────
 
-  test:short:
-    desc: Alias for the short test suite
-    cmds:
-      - task: test
+  pre-commit: { desc: "[lint:new, test]", deps: [lint:new, test] }
+  pre-push:   { desc: "[lint, test:race]", deps: [lint, test:race] }
+  ci:
+    desc: "[lint, test:race:nocache] (parallel + failfast)"
+    deps: [lint, test:race:nocache]
+    output: prefixed
 
-  bench:
-    desc: Run allocation and throughput benchmarks
-    cmds:
-      - go test ./tnats/... -run '^$' -bench=. -benchmem
+  tools:     { desc: "go get -tool gotest.tools/gotestsum golang.org/x/vuln/cmd/govulncheck", cmds: [go get -tool gotest.tools/gotestsum golang.org/x/vuln/cmd/govulncheck] }
 
-  fmt:
-    desc: Apply configured gofumpt and goimports formatters
-    cmds:
-      - golangci-lint fmt
-
-  fmt:check:
-    desc: Check configured formatting without editing files
-    cmds:
-      - golangci-lint fmt --diff
-
-  lint:
-    desc: Run configured golangci-lint checks
-    cmds:
-      - golangci-lint run ./...
-
-  vet:
-    desc: Run go vet across all packages
-    cmds:
-      - go vet ./...
+  setup: { desc: "[setup:files, tools]", deps: [setup:files, tools] }
 
   examples:
-    desc: Build all NATS example executables
+    desc: Check building all examples
     cmds:
-      - go build -o /dev/null ./examples/00_quickstart
-      - go build -o /dev/null ./examples/01_pubsub_and_request_reply
-      - go build -o /dev/null ./examples/02_jetstream_durable_work
-      - go build -o /dev/null ./examples/03_four_microservices
-      - go build -o /dev/null ./examples/04_objectstore_and_kv
-      - go build -o /dev/null ./examples/05_intensive_agent_mesh
-      - go build -o /dev/null ./examples/09_flow_nats
+      - go build ./examples/...
 
-  check:
-    desc: "Full local quality gate: format, lint, vet, race tests, and examples"
+  setup:files:
+    desc: "Fetch missing repo templates (LICENSE, .gitignore, configs...)"
     cmds:
-      - task: fmt:check
-      - task: lint
-      - task: vet
-      - task: test:race
-      - task: examples
-
-  clean:
-    desc: Remove test artifacts and caches
-    cmds:
-      - rm -f coverage.out coverage.html
-      - go clean -testcache
+      - |
+        for f in LICENSE NOTICE .gitattributes .gitignore .golangci.yml .pre-commit-config.yaml; do
+          test -f "$f" || { echo "→ Fetching $f..."; curl -sSfL "https://raw.githubusercontent.com/nexssp/.github/{{.CENTRAL_REF}}/$f" -o "$f"; }
+        done

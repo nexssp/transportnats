@@ -9,11 +9,10 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nexssp/flow/compiler"
+	"github.com/nexssp/flow/compiler/contracts"
 	"github.com/nexssp/kernel/action"
 	"github.com/nexssp/kernel/xerr"
-
-	"github.com/nexssp/flow/contracts"
-	"github.com/nexssp/flow/core"
 
 	"github.com/nexssp/transportnats/tnats"
 )
@@ -21,24 +20,24 @@ import (
 const ID = "transportnats"
 
 func init() {
-	core.Register(ID, Bundle)
+	compiler.Register(ID, Bundle)
 }
 
 // Config controls one Flow-owned NATS transport instance.
 type Config struct {
-	URL            string        `flow:"url"              default:"nats://127.0.0.1:4222"`
-	Name           string        `flow:"name"             default:"nflow-client"`
-	Timeout        time.Duration `flow:"timeout"          default:"5s"`
-	CredsFile      string        `flow:"creds_file"`
-	Token          string        `flow:"token"`
-	RootCAFile     string        `flow:"root_ca_file"`
-	ClientCertFile string        `flow:"client_cert_file"`
-	ClientKeyFile  string        `flow:"client_key_file"`
-	Production     bool          `flow:"production"`
+	URL            string        `nflow:"url"              default:"nats://127.0.0.1:4222"`
+	Name           string        `nflow:"name"             default:"nflow-client"`
+	Timeout        time.Duration `nflow:"timeout"          default:"5s"`
+	CredsFile      string        `nflow:"creds_file"`
+	Token          string        `nflow:"token"`
+	RootCAFile     string        `nflow:"root_ca_file"`
+	ClientCertFile string        `nflow:"client_cert_file"`
+	ClientKeyFile  string        `nflow:"client_key_file"`
+	Production     bool          `nflow:"production"`
 }
 
-func Bundle(rawOpts map[string]string) core.Bundle {
-	cfg, err := core.Decode[Config](rawOpts)
+func Bundle(rawOpts map[string]string) compiler.Bundle {
+	cfg, err := compiler.Decode[Config](rawOpts)
 	if err != nil {
 		panic("transportnats bundle: " + err.Error())
 	}
@@ -53,7 +52,7 @@ func Bundle(rawOpts map[string]string) core.Bundle {
 // NewBundle builds a configured Flow extension and returns configuration
 // errors instead of panicking. Production mode validates TLS and credentials
 // before the transport can be used.
-func NewBundle(cfg Config) (core.Bundle, error) {
+func NewBundle(cfg Config) (compiler.Bundle, error) {
 	if cfg.URL == "" {
 		cfg.URL = "nats://127.0.0.1:4222"
 	}
@@ -64,10 +63,10 @@ func NewBundle(cfg Config) (core.Bundle, error) {
 		cfg.Timeout = 5 * time.Second
 	}
 	if cfg.CredsFile != "" && cfg.Token != "" {
-		return core.Bundle{}, errors.New("configure only one of creds_file or token")
+		return compiler.Bundle{}, errors.New("configure only one of creds_file or token")
 	}
 	if (cfg.ClientCertFile == "") != (cfg.ClientKeyFile == "") {
-		return core.Bundle{}, errors.New("client_cert_file and client_key_file must be configured together")
+		return compiler.Bundle{}, errors.New("client_cert_file and client_key_file must be configured together")
 	}
 
 	opts := []tnats.Option{tnats.WithNATSOptions(nats.Name(cfg.Name))}
@@ -93,15 +92,15 @@ func NewBundle(cfg Config) (core.Bundle, error) {
 	tr := tnats.New(cfg.URL, opts...)
 	if cfg.Production {
 		if err := tr.ValidateProduction(); err != nil {
-			return core.Bundle{}, fmt.Errorf("validate production NATS settings: %w", err)
+			return compiler.Bundle{}, fmt.Errorf("validate production NATS settings: %w", err)
 		}
 	}
 
-	return core.Bundle{
+	return compiler.Bundle{
 		ID:        ID,
 		Libraries: []action.Library{Library(tr, cfg)},
 		Modifiers: Modifiers(),
-		Shutdowns: []core.ShutdownFunc{
+		Shutdowns: []compiler.ShutdownFunc{
 			func(_ context.Context) error {
 				return tr.Close()
 			},
@@ -124,18 +123,18 @@ func Library(tr *tnats.Transport, cfg Config) action.Library {
 	}
 }
 
-func Modifiers() []core.Modifier {
-	return []core.Modifier{
-		core.String("nats_topic", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
+func Modifiers() []compiler.Modifier {
+	return []compiler.Modifier{
+		compiler.String("nats_topic", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			subject, queue, _ := strings.Cut(raw, "@")
 			return b.Route(tnats.Topic(strings.TrimSpace(subject), strings.TrimSpace(queue)))
 		}),
 
-		core.String("nats_request", func(b *action.Builder[any, any], subject string) *action.Builder[any, any] {
+		compiler.String("nats_request", func(b *action.Builder[any, any], subject string) *action.Builder[any, any] {
 			return b.Route(tnats.Request(strings.TrimSpace(subject)))
 		}),
 
-		core.String("nats_durable", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
+		compiler.String("nats_durable", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			parts := strings.Split(raw, ":")
 			if len(parts) != 4 {
 				return b.Route(invalidBinding("@nats_durable expects stream:subject:durable:dlq"))
@@ -143,7 +142,7 @@ func Modifiers() []core.Modifier {
 			return b.Route(tnats.DurableWork(parts[0], parts[1], parts[2], parts[3]))
 		}),
 
-		core.String("nats_consumer", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
+		compiler.String("nats_consumer", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			parts := strings.Split(raw, ":")
 			if len(parts) != 3 {
 				return b.Route(invalidBinding("@nats_consumer expects stream:subject:durable"))
@@ -151,17 +150,17 @@ func Modifiers() []core.Modifier {
 			return b.Route(tnats.Consumer(parts[0], parts[1], parts[2]))
 		}),
 
-		core.String("nats_kv", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
+		compiler.String("nats_kv", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			bucket, key, _ := strings.Cut(raw, ":")
 			return b.Route(tnats.KV(strings.TrimSpace(bucket), strings.TrimSpace(key)))
 		}),
 
-		core.String("nats_object", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
+		compiler.String("nats_object", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			bucket, pattern, _ := strings.Cut(raw, ":")
 			return b.Route(tnats.ObjectStore(strings.TrimSpace(bucket), strings.TrimSpace(pattern)))
 		}),
 
-		core.String("nats_micro", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
+		compiler.String("nats_micro", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			parts := strings.Split(raw, ":")
 			if len(parts) != 4 {
 				return b.Route(invalidBinding("@nats_micro expects service:version:endpoint:subject"))

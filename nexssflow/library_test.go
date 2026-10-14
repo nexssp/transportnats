@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nexssp/flow/compiler"
+	"github.com/nexssp/flow/compiler/contracts"
 	"github.com/nexssp/kernel/action"
-	"github.com/nexssp/transportnats/tnats"
 
-	"github.com/nexssp/flow/contracts"
-	"github.com/nexssp/flow/core"
+	"github.com/nexssp/transportnats/tnats"
 )
 
 type testActionResolver map[string]action.AnyAction
@@ -29,7 +29,7 @@ func (r testActionResolver) Action(name string) (action.AnyAction, bool) {
 }
 
 func TestBundleRegistersAndBuildsWithCurrentFlow(t *testing.T) {
-	factory, ok := core.Lookup(ID)
+	factory, ok := compiler.Lookup(ID)
 	if !ok {
 		t.Fatal("transportnats Flow bundle was not registered")
 	}
@@ -47,7 +47,7 @@ func TestBundleRegistersAndBuildsWithCurrentFlow(t *testing.T) {
 }
 
 func TestNATSRequestModifierCreatesRequestBinding(t *testing.T) {
-	modifierTable := core.NewModifierTable(Modifiers()...)
+	modifierTable := compiler.NewModifierTable(Modifiers()...)
 	base := action.New("inventory.check", func(_ context.Context, req any) (any, error) {
 		return req, nil
 	}).Build()
