@@ -112,14 +112,16 @@ func Library(tr *tnats.Transport, cfg Config) action.Library {
 	if tr == nil {
 		tr = tnats.New(cfg.URL)
 	}
+	actions := []action.AnyAction{
+		listenAction(tr),
+		publishAction(tr, cfg),
+		requestAction(tr, cfg),
+		publishDurableAction(tr, cfg),
+	}
+	actions = append(actions, jetStreamActions(tr, cfg)...)
 	return action.Library{
-		Name: ID,
-		Actions: []action.AnyAction{
-			listenAction(tr),
-			publishAction(tr, cfg),
-			requestAction(tr, cfg),
-			publishDurableAction(tr, cfg),
-		},
+		Name:    ID,
+		Actions: actions,
 	}
 }
 

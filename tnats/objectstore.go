@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -161,7 +162,7 @@ func (t *Transport) consumeObjectEvents(
 
 		ev := objectEventFromInfo(b, info)
 		if b.IncludeData && ev.Type == ObjectPut {
-			if data, derr := readObjectBytes(obs, info.Name, b.MaxBytes); derr == nil {
+			if data, derr := readObjectBytes(ctx, obs, info.Name, b.MaxBytes); derr == nil {
 				ev.Data = data
 			} else {
 				t.log.Warn("object_fetch_failed", "name", info.Name, "error", derr)
@@ -252,8 +253,8 @@ func objectNameMatches(name, pattern string) bool {
 	return nIdx == nLen && pIdx == pLen
 }
 
-func readObjectBytes(obs nats.ObjectStore, name string, maxBytes int64) ([]byte, error) {
-	obj, err := obs.Get(name)
+func readObjectBytes(ctx context.Context, obs nats.ObjectStore, name string, maxBytes int64) ([]byte, error) {
+	obj, err := obs.Get(name, nats.Context(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -261,6 +262,9 @@ func readObjectBytes(obs nats.ObjectStore, name string, maxBytes int64) ([]byte,
 
 	if maxBytes <= 0 {
 		maxBytes = 8 * 1024 * 1024
+	}
+	if maxBytes == math.MaxInt64 {
+		return nil, xerr.BadRequest("object read limit is too large")
 	}
 
 	var buf bytes.Buffer
@@ -294,6 +298,9 @@ func (t *Transport) PutObject(ctx context.Context, bucket, name string, data []b
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if bucket == "" || name == "" {
+		return nil, xerr.BadRequest("objectstore requires a bucket and object name")
+	}
 
 	js, err := t.ensureJetStream()
 	if err != nil {
@@ -305,7 +312,7 @@ func (t *Transport) PutObject(ctx context.Context, bucket, name string, data []b
 		return nil, MapError(err)
 	}
 
-	info, err := obs.PutBytes(name, data)
+	info, err := obs.PutBytes(name, data, nats.Context(ctx))
 	if err != nil {
 		return nil, MapError(err)
 	}
@@ -314,8 +321,23 @@ func (t *Transport) PutObject(ctx context.Context, bucket, name string, data []b
 }
 
 func (t *Transport) GetObject(ctx context.Context, bucket, name string) ([]byte, error) {
+	return t.GetObjectLimited(ctx, bucket, name, 8*1024*1024)
+}
+
+// GetObjectLimited reads at most maxBytes+1 bytes to detect oversized objects
+// without buffering an unbounded object in memory.
+func (t *Transport) GetObjectLimited(ctx context.Context, bucket, name string, maxBytes int64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if bucket == "" || name == "" {
+		return nil, xerr.BadRequest("objectstore requires a bucket and object name")
+	}
+	if maxBytes <= 0 {
+		maxBytes = 8 * 1024 * 1024
+	}
+	if maxBytes == math.MaxInt64 {
+		return nil, xerr.BadRequest("object read limit is too large")
 	}
 
 	js, err := t.ensureJetStream()
@@ -328,12 +350,15 @@ func (t *Transport) GetObject(ctx context.Context, bucket, name string) ([]byte,
 		return nil, MapError(err)
 	}
 
-	return readObjectBytes(obs, name, 0)
+	return readObjectBytes(ctx, obs, name, maxBytes)
 }
 
 func (t *Transport) DeleteObject(ctx context.Context, bucket, name string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if bucket == "" || name == "" {
+		return xerr.BadRequest("objectstore requires a bucket and object name")
 	}
 
 	js, err := t.ensureJetStream()
