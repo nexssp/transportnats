@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -324,6 +325,15 @@ func TestTNATS_Micro_Service_RPC(t *testing.T) {
 
 func TestTNATS_EmbeddedServer_Integration(t *testing.T) {
 	t.Parallel()
+
+	// Keep NATS's default client port occupied: Port 0 must choose a random port.
+	defaultPortListener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:4222")
+	if err != nil && !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("reserve NATS default port for collision test: %v", err)
+	}
+	if defaultPortListener != nil {
+		defer defaultPortListener.Close()
+	}
 
 	tmpDir := t.TempDir()
 	tr := tnats.New("", tnats.WithEmbeddedServer(tnats.EmbeddedConfig{

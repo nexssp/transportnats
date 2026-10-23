@@ -12,7 +12,7 @@ import (
 // EmbeddedConfig konfiguruje wbudowany in-process serwer NATS (np. dla testów CI/CD lub wdrożeń sidecar).
 type EmbeddedConfig struct {
 	Host           string
-	Port           int
+	Port           int // 0 selects an available port; set a positive value to use a fixed port.
 	JetStream      bool
 	StoreDir       string
 	ServerName     string
@@ -72,9 +72,15 @@ func (t *Transport) startEmbedded() error {
 		}
 	}
 
+	port := cfg.Port
+	if port == 0 {
+		// NATS treats zero as its default port; use its sentinel for a random port instead.
+		port = natsserver.RANDOM_PORT
+	}
+
 	opts := &natsserver.Options{
 		Host:          cfg.Host,
-		Port:          cfg.Port,
+		Port:          port,
 		ServerName:    cfg.ServerName,
 		JetStream:     cfg.JetStream,
 		StoreDir:      cfg.StoreDir,
