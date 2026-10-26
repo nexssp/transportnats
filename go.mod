@@ -3,12 +3,12 @@ module github.com/nexssp/transportnats
 go 1.26.9
 
 require (
-	github.com/nats-io/nats-server/v2 v2.15.0
-	github.com/nats-io/nats.go v1.54.0
+	github.com/nats-io/nats-server/v2 v2.15.1
+	github.com/nats-io/nats.go v1.55.0
 	github.com/nats-io/nkeys v0.4.16
-	github.com/nexssp/flow v0.39.0
+	github.com/nexssp/flow v0.45.0
 	github.com/nexssp/kernel v0.35.0
-	github.com/nexssp/transport v0.5.1
+	github.com/nexssp/transport v0.8.0
 )
 
 require (
@@ -19,7 +19,7 @@ require (
 	github.com/go-playground/universal-translator v0.18.2 // indirect
 	github.com/go-playground/validator/v10 v10.30.5 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
-	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/leodido/go-urn v1.5.0 // indirect
 	github.com/minio/highwayhash v1.0.4 // indirect
 	github.com/nats-io/jwt/v2 v2.8.2 // indirect
