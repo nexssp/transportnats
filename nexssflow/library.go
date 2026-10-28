@@ -251,6 +251,8 @@ func listenAction(tr *tnats.Transport) action.AnyAction {
 			return nil, xerr.Unavailable("nats.listen: timeout waiting for connection", err)
 		}
 
+		contracts.SignalReady(ctx)
+
 		err := <-done
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return nil, nil

@@ -88,10 +88,11 @@ func TestListenStartsNATSAndStopsOnContextCancellation(t *testing.T) {
 		NoSigs: true,
 	}))
 
-	listenCtx, cancelListen := context.WithCancel(contracts.WithActionResolver(
+	ready := contracts.NewReadySignal()
+	listenCtx, cancelListen := context.WithCancel(contracts.WithServiceReady(contracts.WithActionResolver(
 		context.Background(),
 		testActionResolver{"quickstart.echo": endpoint},
-	))
+	), ready))
 	defer cancelListen()
 
 	listenDone := make(chan error, 1)
@@ -110,6 +111,13 @@ func TestListenStartsNATSAndStopsOnContextCancellation(t *testing.T) {
 		waitForListener(t, listenDone)
 		t.Fatalf("wait for listener readiness: %v", err)
 	}
+	select {
+	case <-ready.Done():
+	case <-time.After(5 * time.Second):
+		cancelListen()
+		waitForListener(t, listenDone)
+		t.Fatal("Flow service readiness was not signaled after NATS startup")
+	}
 
 	requestCtx, cancelRequest := context.WithTimeout(context.Background(), time.Second)
 	var response echoResponse
@@ -127,6 +135,36 @@ func TestListenStartsNATSAndStopsOnContextCancellation(t *testing.T) {
 	cancelListen()
 	if err := waitForListener(t, listenDone); err != nil {
 		t.Fatalf("listener returned an error during shutdown: %v", err)
+	}
+}
+
+func TestListenDoesNotSignalFlowReadyWhenCanceledBeforeStartup(t *testing.T) {
+	endpoint := action.New("quickstart.echo", func(_ context.Context, msg string) (string, error) {
+		return msg, nil
+	}).Route(tnats.Request("quickstart.echo")).Build()
+	transport := tnats.New("", tnats.WithEmbeddedServer(tnats.EmbeddedConfig{
+		Port:   -1,
+		NoLog:  true,
+		NoSigs: true,
+	}))
+	ready := contracts.NewReadySignal()
+	serviceCtx := contracts.WithServiceReady(contracts.WithActionResolver(
+		context.Background(),
+		testActionResolver{"quickstart.echo": endpoint},
+	), ready)
+	ctx, cancel := context.WithCancel(serviceCtx)
+	cancel()
+
+	_, err := action.InvokeAny(ctx, listenAction(transport), map[string]any{
+		"endpoints": []any{"quickstart.echo"},
+	})
+	if err != nil {
+		t.Fatalf("canceled listener should stop cleanly, got: %v", err)
+	}
+	select {
+	case <-ready.Done():
+		t.Fatal("Flow readiness was signaled for a listener canceled before startup")
+	default:
 	}
 }
 

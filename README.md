@@ -36,7 +36,7 @@ Go application / Nexss Flow
 
 ## Install
 
-Requires **Go 1.26.9 or newer**. NATS Server 2.10+ supports the general feature set; 2.14+ is recommended for the full tested feature set. JetStream must be enabled for durable work, pull consumers, KV, ObjectStore, and JetStream-backed idempotency.
+Requires **Go 1.27.3 or newer**. The Flow `nats.listen` action reports readiness after connecting, mounting its endpoints, and flushing subscriptions. NATS Server 2.10+ supports the general feature set; 2.14+ is recommended for the full tested feature set. JetStream must be enabled for durable work, pull consumers, KV, ObjectStore, and JetStream-backed idempotency.
 
 ```
 go get github.com/nexssp/transportnats@latest
