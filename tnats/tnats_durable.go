@@ -2,7 +2,6 @@ package tnats
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -27,11 +26,17 @@ func (t *Transport) subscribeDurable(
 		nats.BindStream(b.Stream),
 		nats.AckExplicit(),
 		nats.AckWait(b.AckWait),
-		nats.MaxDeliver(b.MaxDeliver),
+		nats.MaxDeliver(-1), // Application code enforces MaxDeliver; NATS must allow DLQ retries.
 		nats.MaxAckPending(b.MaxAckPending),
 	)
 	if err != nil {
 		return MapError(err)
+	}
+	if err := ensureUnlimitedConsumerDeliveries(js, b.Stream, b.Durable); err != nil {
+		if unsubscribeErr := sub.Unsubscribe(); unsubscribeErr != nil {
+			t.log.Warn("nats_pull_subscription_unsubscribe_failed", "error", MapError(unsubscribeErr))
+		}
+		return err
 	}
 
 	t.mu.Lock()
@@ -60,8 +65,37 @@ func (t *Transport) handleDurableMessage(
 		if len(msg.Data) == 0 {
 			return nil
 		}
-
 		return t.codec.Unmarshal(msg.Data, v)
+	}
+
+	metaInfo, metadataErr := msg.Metadata()
+	if metadataErr != nil {
+		t.log.Warn("durable_metadata_failed", "subject", msg.Subject, "error", MapError(metadataErr))
+		ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
+		delay := durableRetryDelay(MapError(metadataErr), b.RetryDelay)
+		if err := msg.NakWithDelay(delay, nats.Context(ackCtx)); err != nil {
+			t.log.Error("durable_nak_failed", "subject", msg.Subject, "delay", delay, "error", MapError(err))
+		}
+		cancel()
+		return
+	}
+	deliveries := metaInfo.NumDelivered
+	if maxDeliverExceeded(deliveries, b.MaxDeliver) {
+		ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
+		defer cancel()
+		exceededErr := xerr.Internal("durable delivery limit exceeded; retrying dead-letter handling")
+		binding := ConsumerBinding{
+			Stream:            b.Stream,
+			Durable:           b.Durable,
+			DeadLetterSubject: b.DeadLetterSubject,
+		}
+		if err := t.dlqConsumerMessage(ackCtx, js, binding, msg, exceededErr, deliveries, true); err != nil {
+			t.log.Error("durable_dead_letter_failed", "subject", msg.Subject, "error", err)
+			if nakErr := msg.NakWithDelay(durableRetryDelay(err, b.RetryDelay), nats.Context(ackCtx)); nakErr != nil {
+				t.log.Error("durable_nak_failed", "subject", msg.Subject, "error", MapError(nakErr))
+			}
+		}
+		return
 	}
 
 	var execErr error
@@ -71,62 +105,42 @@ func (t *Transport) handleDurableMessage(
 		_, execErr = ex.ExecuteDecoded(reqCtx, decoder)
 	}
 
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
+	defer cancel()
 	if execErr == nil {
-		ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
-		defer cancel()
-
-		_ = msg.AckSync(nats.Context(ackCtx)) //nolint:errcheck // ack failure is not recoverable by the handler
-
-		return
-	}
-
-	metaInfo, metadataErr := msg.Metadata()
-	if metadataErr != nil || b.MaxDeliver <= 0 || metaInfo.NumDelivered < uint64(b.MaxDeliver) {
-		delay := b.RetryDelay
-		if retry, ok := execErr.(interface{ RetryAfter() time.Duration }); ok && retry.RetryAfter() > 0 {
-			delay = retry.RetryAfter()
+		if err := msg.AckSync(nats.Context(ackCtx)); err != nil {
+			t.log.Error("durable_ack_failed", "subject", msg.Subject, "error", MapError(err))
 		}
-
-		_ = msg.NakWithDelay(delay) //nolint:errcheck // NAck failure falls back to AckWait redelivery
-
 		return
 	}
 
-	headers := make(map[string]string, len(msg.Header))
-	for key, values := range msg.Header {
-		if len(values) > 0 {
-			headers[key] = values[0]
+	t.log.Error("durable_action_failed", "subject", msg.Subject, "error", execErr)
+	if !maxDeliverReached(deliveries, b.MaxDeliver) {
+		delay := durableRetryDelay(execErr, b.RetryDelay)
+		if err := msg.NakWithDelay(delay, nats.Context(ackCtx)); err != nil {
+			t.log.Error("durable_nak_failed", "subject", msg.Subject, "delay", delay, "error", MapError(err))
+		}
+		return
+	}
+
+	binding := ConsumerBinding{
+		Stream:            b.Stream,
+		Durable:           b.Durable,
+		DeadLetterSubject: b.DeadLetterSubject,
+	}
+	if err := t.dlqConsumerMessage(ackCtx, js, binding, msg, execErr, metaInfo.NumDelivered, true); err != nil {
+		t.log.Error("durable_dead_letter_failed", "subject", msg.Subject, "error", err)
+		if nakErr := msg.NakWithDelay(b.RetryDelay, nats.Context(ackCtx)); nakErr != nil {
+			t.log.Error("durable_nak_failed", "subject", msg.Subject, "error", MapError(nakErr))
 		}
 	}
+}
 
-	dead := DeadLetter{
-		Stream:     b.Stream,
-		Subject:    msg.Subject,
-		Durable:    b.Durable,
-		Deliveries: metaInfo.NumDelivered,
-		FailedAt:   time.Now().UTC(),
-		Error:      execErr.Error(),
-		Payload:    append([]byte(nil), msg.Data...),
-		Headers:    headers,
+func durableRetryDelay(err error, fallback time.Duration) time.Duration {
+	if delay := retryAfter(err); delay > 0 {
+		return delay
 	}
-
-	payload, marshalErr := json.Marshal(dead)
-	if marshalErr != nil {
-		_ = msg.NakWithDelay(b.RetryDelay) //nolint:errcheck // NAck failure falls back to AckWait redelivery
-
-		return
-	}
-
-	dlqMsg := nats.NewMsg(b.DeadLetterSubject)
-
-	dlqMsg.Data = payload
-	if _, publishErr := js.PublishMsg(dlqMsg); publishErr != nil {
-		_ = msg.NakWithDelay(b.RetryDelay) //nolint:errcheck // NAck failure falls back to AckWait redelivery
-
-		return
-	}
-
-	_ = msg.Term() //nolint:errcheck // terminal state; no retry possible
+	return fallback
 }
 
 func validateDurableBinding(b DurableBinding) error {

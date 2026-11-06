@@ -42,59 +42,60 @@ func (t *Transport) ensureStream(js nats.JetStreamContext, name string, subjects
 	if len(subjects) == 0 {
 		return nil
 	}
+	t.streamConfigMu.Lock()
+	defer t.streamConfigMu.Unlock()
 
-	info, err := js.StreamInfo(name)
-	if err != nil && !errors.Is(err, nats.ErrStreamNotFound) {
-		return MapError(err)
-	}
+	for range 3 {
+		info, err := js.StreamInfo(name)
+		if errors.Is(err, nats.ErrStreamNotFound) {
+			cfg := &nats.StreamConfig{
+				Name:      name,
+				Subjects:  subjects,
+				Storage:   nats.FileStorage,
+				Retention: nats.LimitsPolicy,
+				Discard:   nats.DiscardOld,
+				MaxAge:    7 * 24 * time.Hour,
+			}
+			if t.streamConfigModifier != nil {
+				t.streamConfigModifier(cfg)
+			}
 
-	if errors.Is(err, nats.ErrStreamNotFound) {
-		cfg := &nats.StreamConfig{
-			Name:      name,
-			Subjects:  subjects,
-			Storage:   nats.FileStorage,
-			Retention: nats.LimitsPolicy,
-			Discard:   nats.DiscardOld,
-			MaxAge:    7 * 24 * time.Hour,
-		}
-		if t.streamConfigModifier != nil {
-			t.streamConfigModifier(cfg)
-		}
-
-		_, addErr := js.AddStream(cfg)
-		if addErr != nil && !errors.Is(addErr, nats.ErrStreamNameAlreadyInUse) {
+			_, addErr := js.AddStream(cfg)
+			if addErr == nil {
+				return nil
+			}
+			if errors.Is(addErr, nats.ErrStreamNameAlreadyInUse) {
+				continue
+			}
 			return MapError(addErr)
 		}
+		if err != nil {
+			return MapError(err)
+		}
 
-		return nil
-	}
-
-	updated := false
-
-	for _, s := range subjects {
-		found := false
-
-		for _, cs := range info.Config.Subjects {
-			if cs == s || subjectPatternCovers(cs, s) {
-				found = true
-
-				break
+		updated := false
+		for _, subject := range subjects {
+			found := false
+			for _, configured := range info.Config.Subjects {
+				if configured == subject || subjectPatternCovers(configured, subject) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				info.Config.Subjects = append(info.Config.Subjects, subject)
+				updated = true
 			}
 		}
-
-		if !found {
-			info.Config.Subjects = append(info.Config.Subjects, s)
-			updated = true
+		if !updated {
+			return nil
+		}
+		if _, updateErr := js.UpdateStream(&info.Config); updateErr != nil {
+			return MapError(updateErr)
 		}
 	}
 
-	if updated {
-		_, updateErr := js.UpdateStream(&info.Config)
-
-		return MapError(updateErr)
-	}
-
-	return nil
+	return xerr.Conflict("nats: stream configuration changed repeatedly during provisioning")
 }
 
 func subjectPatternCovers(pattern, subject string) bool {
@@ -116,7 +117,7 @@ func subjectPatternCovers(pattern, subject string) bool {
 
 		patternToken := pattern[patternStart:patternEnd]
 		if patternToken == ">" {
-			return true
+			return subjectStart < len(subject)
 		}
 
 		if subjectStart >= len(subject) || (patternToken != "*" && patternToken != subject[subjectStart:subjectEnd]) {

@@ -38,7 +38,9 @@ func runEmbeddedNATS(t *testing.T) (srv *natsserver.Server, url string) {
 	}
 	port := addr.Port
 
-	_ = l.Close()
+	if err := l.Close(); err != nil {
+		t.Fatalf("failed releasing test port: %v", err)
+	}
 
 	opts := &natsserver.Options{
 		Host:      "127.0.0.1",
@@ -66,6 +68,36 @@ func runEmbeddedNATS(t *testing.T) (srv *natsserver.Server, url string) {
 	})
 
 	return server, fmt.Sprintf("nats://127.0.0.1:%d", port)
+}
+
+func TestFromConnDoesNotRedialOrCloseCallerConnection(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+
+	tr := tnats.FromConn(nc)
+	got, err := tr.EnsureConn(t.Context())
+	if err != nil {
+		t.Fatalf("EnsureConn before Close: %v", err)
+	}
+	if got != nc {
+		t.Fatal("EnsureConn returned a different connection")
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("transport Close: %v", err)
+	}
+	if nc.IsClosed() {
+		t.Fatal("transport Close closed the caller-owned connection")
+	}
+	if _, err := tr.EnsureConn(t.Context()); xerr.KindFrom(err) != xerr.KindUnavailable {
+		t.Fatalf("EnsureConn after Close = %v, want unavailable without redial", err)
+	}
+	if nc.IsClosed() {
+		t.Fatal("EnsureConn closed the caller-owned connection")
+	}
 }
 
 type OrderReq struct {
@@ -430,6 +462,9 @@ func TestTNATS_Auth_InvalidNKey_GracefulFailure(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	if err := tr.Publish(ctx, "auth.invalid", []byte("payload")); xerr.KindFrom(err) != xerr.KindInternal {
+		t.Fatalf("Publish with invalid NKey seed = %v, want stored initialization error", err)
+	}
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
 

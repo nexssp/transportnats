@@ -64,14 +64,17 @@ Typed route modifiers bind Kernel actions to Core NATS, JetStream, or NATS Micro
 | `tnats.Request(subject, timeout)` | Request-scoped RPC | Synchronous service calls |
 | `tnats.DurableWork(...)` | JetStream, at-least-once, ACK/NAK and optional DLQ | Work that must be retried or recovered |
 | `tnats.Consumer(...)` | JetStream pull consumer with configurable delivery and ACK policies | Replay, filtering, and controlled consumption |
-| `tnats.KV(...)`, `tnats.ObjectStore(...)` | JetStream change notifications | Configuration and object events |
+| `tnats.KV(...)` | JetStream value updates; delete/purge markers are ignored | Configuration changes |
+| `tnats.ObjectStore(...)` | JetStream object PUT and DELETE events | Object lifecycle events |
 | `tnats.Service(...)` | NATS Micro discovery and RPC | Broker-native service endpoints |
+
+For `Consumer` and `DurableWork`, `MaxDeliver` limits action executions; JetStream redelivery itself remains unlimited so a failed dead-letter publish can be retried without discarding the original message. Messages are terminated only after the dead-letter publish succeeds. A consumer using `AckNone` cannot be combined with a dead-letter subject because it cannot safely redeliver on failure.
 
 The transport propagates Kernel request, execution, trace, and span identifiers through message headers. Remote errors are reconstructed through the Kernel error taxonomy rather than requiring callers to parse strings.
 
 ## Nexss Flow 🌀 integration
 
-The Flow bundle compiles `.nflow` pipelines into Kernel actions and mounts those with NATS bindings. Configure `url` to point at a reachable NATS server. `nats.listen` discovers NATS-bound actions in the Flow resolver. Binding modifiers are `:nats_topic`, `:nats_request`, `:nats_durable`, `:nats_consumer`, `:nats_kv`, `:nats_object`, and `:nats_micro`. The Flow action surface includes `nats.listen`, `nats.publish`, `nats.request`, `nats.publish_durable`, `nats.kv.*`, and `nats.object.*`. Bundle options include `url`, `name`, `timeout`, credentials/token, TLS files, and `production`; use external secret management for credentials and private keys. Never commit secrets in `.nflow` files.
+The Flow bundle compiles `.nflow` pipelines into Kernel actions and mounts those with NATS bindings. Configure `url` to point at a reachable NATS server. `nats.listen` discovers NATS-bound actions in the Flow resolver. Binding modifiers are `:nats_topic`, `:nats_request` (also available as `:nats-rpc`), `:nats_durable`, `:nats_consumer`, `:nats_kv`, `:nats_object`, and `:nats_micro`. For `:nats_kv`, use `bucket:key`; an empty key (`bucket:`) watches every key in the bucket. KV binding watchers dispatch value updates and intentionally suppress delete/purge markers; the `nats.kv.delete` action is available for request/response deletes. The Flow action surface includes `nats.listen`, `nats.publish`, `nats.request`, `nats.publish_durable`, `nats.kv.*`, and `nats.object.*`. Bundle options include `url`, `name`, `timeout`, credentials/token, TLS files, and `production`; use external secret management for credentials and private keys. Never commit secrets in `.nflow` files.
 
 The following Flow excerpt illustrates a NATS binding; the full runnable service example is in the [centralized Nexss examples repository](https://github.com/nexssp/examples):
 

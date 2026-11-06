@@ -111,7 +111,9 @@ func (t *Transport) mountMicroServices(ctx context.Context, nc *nats.Conn, actio
 
 		for i := range eps {
 			if err := t.registerMicroEndpoint(ctx, svc, eps[i]); err != nil {
-				_ = svc.Stop() //nolint:errcheck // service stop on shutdown is best-effort
+				if stopErr := svc.Stop(); stopErr != nil {
+					t.log.Warn("nats_micro_service_stop_failed", "service", head.Service, "error", MapError(stopErr))
+				}
 
 				return err
 			}
@@ -132,6 +134,11 @@ func (t *Transport) mountMicroServices(ctx context.Context, nc *nats.Conn, actio
 func (t *Transport) registerMicroEndpoint(ctx context.Context, svc micro.Service, ep microEndpoint) error {
 	b := ep.Binding
 	handler := func(req micro.Request) {
+		if !t.startWorker() {
+			return
+		}
+		defer t.workersWg.Done()
+
 		reqCtx, scope, release := xctx.NewScope(ctx)
 		defer release()
 
@@ -164,19 +171,26 @@ func (t *Transport) registerMicroEndpoint(ctx context.Context, svc micro.Service
 		res, execErr := ep.Exec.ExecuteDecoded(reqCtx, decoder)
 		if execErr != nil {
 			appErr := xerr.From(execErr)
-			_ = req.Error(string(appErr.Kind), appErr.Error(), nil) //nolint:errcheck // micro response write failure is terminal
+			if err := req.Error(string(appErr.Kind), appErr.Error(), nil); err != nil {
+				t.log.Error("nats_micro_error_response_failed", "service", b.Service, "endpoint", b.Endpoint, "error", MapError(err))
+			}
 
 			return
 		}
 
 		payload, mErr := t.codec.Marshal(res)
 		if mErr != nil {
-			_ = req.Error(string(xerr.KindInternal), "response marshal failed", nil) //nolint:errcheck // micro response write failure is terminal
+			t.log.Error("nats_micro_response_marshal_failed", "service", b.Service, "endpoint", b.Endpoint, "error", mErr)
+			if err := req.Error(string(xerr.KindInternal), "response marshal failed", nil); err != nil {
+				t.log.Error("nats_micro_error_response_failed", "service", b.Service, "endpoint", b.Endpoint, "error", MapError(err))
+			}
 
 			return
 		}
 
-		_ = req.Respond(payload) //nolint:errcheck // micro response write failure is terminal
+		if err := req.Respond(payload); err != nil {
+			t.log.Error("nats_micro_response_failed", "service", b.Service, "endpoint", b.Endpoint, "error", MapError(err))
+		}
 	}
 
 	opts := []micro.EndpointOpt{

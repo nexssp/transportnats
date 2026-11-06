@@ -21,7 +21,10 @@ func (t *Transport) Publish(ctx context.Context, subject string, payload any) er
 	msg := &nats.Msg{Subject: subject, Data: body}
 	propagateToMsg(ctx, msg)
 
-	return nc.PublishMsg(msg)
+	if err := nc.PublishMsg(msg); err != nil {
+		return MapError(err)
+	}
+	return nil
 }
 
 func (t *Transport) PublishDurable(ctx context.Context, binding DurableBinding, payload any) error {

@@ -119,7 +119,10 @@ func (t *Transport) startEmbedded() error {
 	t.url = clientURL
 	t.mu.Unlock()
 
-	addr, _ := srv.Addr().(*net.TCPAddr)
+	addr, ok := srv.Addr().(*net.TCPAddr)
+	if !ok {
+		t.log.Warn("nats_embedded_addr_not_tcp", "address", srv.Addr())
+	}
 	t.log.Info("nats_embedded_started",
 		"url", clientURL,
 		"host", cfg.Host,

@@ -215,21 +215,47 @@ func TestFlowJetStreamActionsCrossConnectionIntegration(t *testing.T) {
 		t.Fatalf("conditional KV delete with current revision: %v", err)
 	}
 
+	expiryWatcher, err := writerKV.Watch(ctx, "expiring", jetstream.UpdatesOnly())
+	if err != nil {
+		t.Fatalf("watch per-key TTL expiration: %v", err)
+	}
+	defer func() {
+		if err := expiryWatcher.Stop(); err != nil {
+			t.Errorf("stop per-key TTL watcher: %v", err)
+		}
+	}()
 	if _, err := invoke("nats.kv.create", map[string]any{
 		"bucket": "FLOW_KV", "key": "expiring", "value": "short-lived", "ttl": "1s",
 	}); err != nil {
 		t.Fatalf("Flow KV create with per-key TTL: %v", err)
 	}
-	deadline := time.Now().Add(4 * time.Second)
+	expired := false
+	deadline := time.NewTimer(4 * time.Second)
+	defer deadline.Stop()
+	watcherUpdates := expiryWatcher.Updates()
 	for {
-		_, err = writerKV.Get(ctx, "expiring")
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
+		select {
+		case entry, ok := <-watcherUpdates:
+			if !ok {
+				t.Fatal("per-key TTL watcher closed before the expiration event")
+			}
+			if entry != nil && entry.Key() == "expiring" {
+				switch entry.Operation() {
+				case jetstream.KeyValuePut:
+				// Wait for the later delete or purge marker.
+				case jetstream.KeyValueDelete, jetstream.KeyValuePurge:
+					expired = true
+				}
+			}
+		case <-deadline.C:
+			t.Fatal("timed out waiting for per-key TTL delete event")
+		}
+		if expired {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("per-key TTL did not expire; latest read error: %v", err)
-		}
-		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := writerKV.Get(ctx, "expiring"); !errors.Is(err, jetstream.ErrKeyNotFound) {
+		t.Fatalf("per-key TTL delete event arrived but key is still readable: %v", err)
 	}
 
 	objectPut, err := invoke("nats.object.put", map[string]any{

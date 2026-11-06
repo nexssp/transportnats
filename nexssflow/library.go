@@ -53,15 +53,7 @@ func Bundle(rawOpts map[string]string) compiler.Bundle {
 // errors instead of panicking. Production mode validates TLS and credentials
 // before the transport can be used.
 func NewBundle(cfg Config) (compiler.Bundle, error) {
-	if cfg.URL == "" {
-		cfg.URL = "nats://127.0.0.1:4222"
-	}
-	if cfg.Name == "" {
-		cfg.Name = "nflow-client"
-	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = 5 * time.Second
-	}
+	cfg = normalizeConfig(cfg)
 	if cfg.CredsFile != "" && cfg.Token != "" {
 		return compiler.Bundle{}, errors.New("configure only one of creds_file or token")
 	}
@@ -108,7 +100,21 @@ func NewBundle(cfg Config) (compiler.Bundle, error) {
 	}, nil
 }
 
+func normalizeConfig(cfg Config) Config {
+	if cfg.URL == "" {
+		cfg.URL = "nats://127.0.0.1:4222"
+	}
+	if cfg.Name == "" {
+		cfg.Name = "nflow-client"
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 5 * time.Second
+	}
+	return cfg
+}
+
 func Library(tr *tnats.Transport, cfg Config) action.Library {
+	cfg = normalizeConfig(cfg)
 	if tr == nil {
 		tr = tnats.New(cfg.URL)
 	}
@@ -126,15 +132,18 @@ func Library(tr *tnats.Transport, cfg Config) action.Library {
 }
 
 func Modifiers() []compiler.Modifier {
+	requestModifier := func(b *action.Builder[any, any], subject string) *action.Builder[any, any] {
+		return b.Route(tnats.Request(strings.TrimSpace(subject)))
+	}
+
 	return []compiler.Modifier{
 		compiler.String("nats_topic", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			subject, queue, _ := strings.Cut(raw, "@")
 			return b.Route(tnats.Topic(strings.TrimSpace(subject), strings.TrimSpace(queue)))
 		}),
 
-		compiler.String("nats_request", func(b *action.Builder[any, any], subject string) *action.Builder[any, any] {
-			return b.Route(tnats.Request(strings.TrimSpace(subject)))
-		}),
+		compiler.String("nats_request", requestModifier),
+		compiler.String("nats-rpc", requestModifier),
 
 		compiler.String("nats_durable", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			parts := strings.Split(raw, ":")
@@ -153,12 +162,18 @@ func Modifiers() []compiler.Modifier {
 		}),
 
 		compiler.String("nats_kv", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
-			bucket, key, _ := strings.Cut(raw, ":")
+			bucket, key, ok := strings.Cut(raw, ":")
+			if !ok {
+				return b.Route(invalidBinding("@nats_kv expects bucket:key (key may be empty to watch all keys)"))
+			}
 			return b.Route(tnats.KV(strings.TrimSpace(bucket), strings.TrimSpace(key)))
 		}),
 
 		compiler.String("nats_object", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
-			bucket, pattern, _ := strings.Cut(raw, ":")
+			bucket, pattern, ok := strings.Cut(raw, ":")
+			if !ok {
+				return b.Route(invalidBinding("@nats_object expects bucket:pattern (pattern may be empty to watch all objects)"))
+			}
 			return b.Route(tnats.ObjectStore(strings.TrimSpace(bucket), strings.TrimSpace(pattern)))
 		}),
 

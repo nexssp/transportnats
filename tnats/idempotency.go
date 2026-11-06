@@ -3,7 +3,11 @@ package tnats
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -14,22 +18,26 @@ import (
 
 const idempotencyFinalizeTimeout = 5 * time.Second
 
-// msgHash generates a 64-byte hex hash while keeping zero heap allocations
+// msgHash generates a 64-character hex hash while keeping zero heap allocations
 // for the common case of small subjects and payloads.
 func msgHash(msg *nats.Msg) string {
-	totalLen := len(msg.Subject) + len(msg.Data)
+	var subjectLen [8]byte
+	binary.BigEndian.PutUint64(subjectLen[:], uint64(len(msg.Subject)))
+	totalLen := len(subjectLen) + len(msg.Subject) + len(msg.Data)
 	if totalLen <= 512 {
 		var stackBuf [512]byte
-		copy(stackBuf[:], msg.Subject)
-		copy(stackBuf[len(msg.Subject):], msg.Data)
+		copy(stackBuf[:], subjectLen[:])
+		copy(stackBuf[len(subjectLen):], msg.Subject)
+		copy(stackBuf[len(subjectLen)+len(msg.Subject):], msg.Data)
 		sum := sha256.Sum256(stackBuf[:totalLen])
 
 		return hex.EncodeToString(sum[:])
 	}
 
 	h := sha256.New()
-	_, _ = h.Write([]byte(msg.Subject))
-	_, _ = h.Write(msg.Data)
+	_, _ = h.Write(subjectLen[:])       // SHA-256 writes never return an error.
+	_, _ = h.Write([]byte(msg.Subject)) // SHA-256 writes never return an error.
+	_, _ = h.Write(msg.Data)            // SHA-256 writes never return an error.
 
 	var sumBuf [32]byte
 
@@ -76,9 +84,10 @@ func executeWithCoordinator(
 	decoder func(any) error,
 	c codec.Codec,
 ) ([]byte, error) {
-	claim, err := coordinator.Claim(ctx, key, reqHash, cfg.EffectiveLeaseTTL())
+	leaseTTL := cfg.EffectiveLeaseTTL()
+	claim, err := coordinator.Claim(ctx, key, reqHash, leaseTTL)
 	if err != nil {
-		return encodeError(c, xerr.Unavailable("idempotency coordination unavailable", err))
+		return encodeError(c, err)
 	}
 
 	switch claim.State {
@@ -101,11 +110,29 @@ func executeWithCoordinator(
 	completed := false
 	defer func() {
 		if !completed {
-			_ = coordinator.Release(ctx, key, claim.Token) //nolint:errcheck // release is best-effort; lease expires automatically
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), idempotencyFinalizeTimeout)
+			defer cancel()
+			if releaseErr := coordinator.Release(releaseCtx, key, claim.Token); releaseErr != nil {
+				slog.ErrorContext(ctx, "idempotency_claim_release_failed", "error", releaseErr)
+			}
 		}
 	}()
 
-	res, execErr := ex.ExecuteDecoded(ctx, decoder)
+	actionCtx, cancelAction := context.WithCancel(ctx)
+	renewalErrors, stopRenewal := startCoordinatorLeaseRenewal(
+		ctx, coordinator, key, claim.Token, leaseTTL, cancelAction,
+	)
+	defer cancelAction()
+	defer stopRenewal()
+
+	res, execErr := ex.ExecuteDecoded(actionCtx, decoder)
+	stopRenewal()
+	cancelAction()
+	select {
+	case renewalErr := <-renewalErrors:
+		return encodeError(c, renewalErr)
+	default:
+	}
 	if execErr != nil {
 		return encodeError(c, execErr)
 	}
@@ -132,6 +159,63 @@ func executeWithCoordinator(
 	completed = true
 
 	return replyBytes, nil
+}
+
+func startCoordinatorLeaseRenewal(
+	ctx context.Context, coordinator action.IdempotencyCoordinator, key, token string, leaseTTL time.Duration,
+	cancelAction context.CancelFunc,
+) (renewalErrs <-chan error, stopRenewal func()) {
+	renewer, ok := coordinator.(action.IdempotencyLeaseRenewer)
+	if !ok || leaseTTL <= 0 {
+		return nil, func() {}
+	}
+
+	interval := leaseTTL / 3
+	if interval <= 0 {
+		interval = leaseTTL
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	renewalErrors := make(chan error, 1)
+	var stateMu sync.Mutex
+	stopped := false
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				renewCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), interval)
+				renewErr := renewer.RenewClaim(renewCtx, key, token, leaseTTL)
+				cancel()
+				if renewErr != nil {
+					stateMu.Lock()
+					if !stopped {
+						mappedErr := MapError(renewErr)
+						renewalErrors <- mappedErr
+						cancelAction()
+						slog.WarnContext(ctx, "idempotency_lease_renewal_failed", "key", key, "error", mappedErr)
+					}
+					stateMu.Unlock()
+					return
+				}
+			}
+		}
+	}()
+
+	var stopOnce sync.Once
+	return renewalErrors, func() {
+		stopOnce.Do(func() {
+			stateMu.Lock()
+			stopped = true
+			stateMu.Unlock()
+			close(stop)
+			<-done
+		})
+	}
 }
 
 func executeWithLegacyStore(
@@ -178,7 +262,15 @@ func encodeError(c codec.Codec, err error) ([]byte, error) {
 		c = codec.Default
 	}
 
-	encoded, _ := c.Marshal(appErr.Public("")) //nolint:errcheck // marshaling a Public error envelope cannot fail
-
+	encoded, marshalErr := c.Marshal(appErr.Public(""))
+	if marshalErr == nil {
+		return encoded, err
+	}
+	slog.Error("nats_error_response_marshal_failed", "error", marshalErr)
+	encoded, fallbackErr := json.Marshal(appErr.Public(""))
+	if fallbackErr != nil {
+		slog.Error("nats_error_response_fallback_failed", "error", fallbackErr)
+		encoded = []byte(`{"error":"internal","message":"failed to encode error response"}`)
+	}
 	return encoded, err
 }

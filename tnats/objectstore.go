@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/nexssp/kernel/action"
 	"github.com/nexssp/kernel/xctx"
 	"github.com/nexssp/kernel/xerr"
@@ -86,6 +88,10 @@ func (t *Transport) mountObjectStore(
 	if err != nil {
 		return MapError(err)
 	}
+	watcher, err := obs.Watch()
+	if err != nil {
+		return MapError(err)
+	}
 
 	pattern := b.Pattern
 	if pattern == "" {
@@ -93,45 +99,45 @@ func (t *Transport) mountObjectStore(
 	}
 
 	t.workersWg.Go(func() {
-		t.watchObjectStore(ctx, obs, ex, b, pattern)
+		t.watchObjectStore(ctx, obs, watcher, ex, b, pattern)
 	})
 
 	return nil
 }
 
 func (t *Transport) watchObjectStore(
-	ctx context.Context, obs nats.ObjectStore, ex action.Executable, b ObjectBinding, pattern string,
+	ctx context.Context, obs nats.ObjectStore, watcher nats.ObjectWatcher,
+	ex action.Executable, b ObjectBinding, pattern string,
 ) {
 	backoff := 100 * time.Millisecond
-
 	for {
+		t.consumeObjectEvents(ctx, obs, ex, b, pattern, watcher)
 		if ctx.Err() != nil {
 			return
 		}
 
-		w, err := obs.Watch()
-		if err != nil {
-			t.log.Error("object_watch_failed", "bucket", b.Bucket, "error", err)
-
+		for {
 			select {
 			case <-time.After(backoff):
-				if backoff < 5*time.Second {
-					backoff *= 2
-				}
-
-				continue
 			case <-ctx.Done():
 				return
 			}
-		}
 
-		backoff = 100 * time.Millisecond
-		t.consumeObjectEvents(ctx, obs, ex, b, pattern, w)
+			nextWatcher, err := obs.Watch()
+			if err != nil {
+				t.log.Error("object_watch_failed", "bucket", b.Bucket, "error", MapError(err), "retry_delay", backoff)
+				if backoff < 5*time.Second {
+					backoff *= 2
+					if backoff > 5*time.Second {
+						backoff = 5 * time.Second
+					}
+				}
+				continue
+			}
 
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return
+			watcher = nextWatcher
+			backoff = 100 * time.Millisecond
+			break
 		}
 	}
 }
@@ -142,11 +148,19 @@ func (t *Transport) consumeObjectEvents(
 ) {
 	stopDone := make(chan struct{})
 	defer close(stopDone)
+	var stopOnce sync.Once
+	stopWatcher := func() {
+		stopOnce.Do(func() {
+			if err := w.Stop(); err != nil {
+				t.log.Warn("object_watch_stop_failed", "bucket", b.Bucket, "error", MapError(err))
+			}
+		})
+	}
 
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = w.Stop() //nolint:errcheck // watcher stop is best-effort
+			stopWatcher()
 		case <-stopDone:
 		}
 	}()
@@ -180,7 +194,7 @@ func (t *Transport) consumeObjectEvents(
 		release()
 	}
 
-	_ = w.Stop() //nolint:errcheck // watcher stop is best-effort
+	stopWatcher()
 }
 
 func objectEventFromInfo(b ObjectBinding, info *nats.ObjectInfo) ObjectEvent {
@@ -254,22 +268,25 @@ func objectNameMatches(name, pattern string) bool {
 }
 
 func readObjectBytes(ctx context.Context, obs nats.ObjectStore, name string, maxBytes int64) ([]byte, error) {
-	obj, err := obs.Get(name, nats.Context(ctx))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = obj.Close() }()
-
 	if maxBytes <= 0 {
 		maxBytes = 8 * 1024 * 1024
 	}
 	if maxBytes == math.MaxInt64 {
 		return nil, xerr.BadRequest("object read limit is too large")
 	}
+	obj, err := obs.Get(name, nats.Context(ctx))
+	if err != nil {
+		return nil, MapError(err)
+	}
 
 	var buf bytes.Buffer
-	if _, err := io.CopyN(&buf, obj, maxBytes+1); err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
+	_, readErr := io.CopyN(&buf, obj, maxBytes+1)
+	closeErr := obj.Close()
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return nil, MapError(errors.Join(readErr, closeErr))
+	}
+	if closeErr != nil {
+		return nil, MapError(closeErr)
 	}
 
 	if int64(buf.Len()) > maxBytes {
@@ -300,6 +317,9 @@ func (t *Transport) PutObject(ctx context.Context, bucket, name string, data []b
 	}
 	if bucket == "" || name == "" {
 		return nil, xerr.BadRequest("objectstore requires a bucket and object name")
+	}
+	if _, err := t.EnsureConn(ctx); err != nil {
+		return nil, err
 	}
 
 	js, err := t.ensureJetStream()
@@ -339,6 +359,9 @@ func (t *Transport) GetObjectLimited(ctx context.Context, bucket, name string, m
 	if maxBytes == math.MaxInt64 {
 		return nil, xerr.BadRequest("object read limit is too large")
 	}
+	if _, err := t.EnsureConn(ctx); err != nil {
+		return nil, err
+	}
 
 	js, err := t.ensureJetStream()
 	if err != nil {
@@ -361,17 +384,21 @@ func (t *Transport) DeleteObject(ctx context.Context, bucket, name string) error
 		return xerr.BadRequest("objectstore requires a bucket and object name")
 	}
 
-	js, err := t.ensureJetStream()
+	nc, err := t.EnsureConn(ctx)
 	if err != nil {
 		return err
 	}
 
-	obs, err := js.ObjectStore(bucket)
+	js, err := jetstream.New(nc)
+	if err != nil {
+		return MapError(err)
+	}
+	obs, err := js.ObjectStore(ctx, bucket)
 	if err != nil {
 		return MapError(err)
 	}
 
-	return MapError(obs.Delete(name))
+	return MapError(obs.Delete(ctx, name))
 }
 
 var _ action.Binding = ObjectBinding{}

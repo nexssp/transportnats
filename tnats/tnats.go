@@ -40,6 +40,7 @@ type ProductionSecurity struct {
 type Transport struct {
 	url                  string
 	conn                 *nats.Conn
+	providedConn         bool
 	js                   nats.JetStreamContext
 	embedded             *EmbeddedConfig
 	embeddedSrv          *natsserver.Server
@@ -60,9 +61,13 @@ type Transport struct {
 	log                  *slog.Logger
 	subs                 []*nats.Subscription
 	workersWg            sync.WaitGroup
+	closing              bool
 	verifiedStreams      sync.Map
+	streamConfigMu       sync.Mutex
 	mu                   sync.RWMutex
-	connectMu            sync.Mutex
+	connectGate          chan struct{}
+	connectGateOnce      sync.Once
+	connectCancel        context.CancelFunc
 	running              atomic.Bool
 }
 
@@ -203,6 +208,16 @@ func (t *Transport) Mount(actions []action.AnyAction) {
 	defer t.mu.Unlock()
 
 	t.actions = append([]action.AnyAction(nil), actions...)
+}
+
+func (t *Transport) startWorker() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closing {
+		return false
+	}
+	t.workersWg.Add(1)
+	return true
 }
 
 func (t *Transport) WaitReady(ctx context.Context) error {

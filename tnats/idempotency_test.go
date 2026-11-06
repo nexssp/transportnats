@@ -231,23 +231,28 @@ func TestKVIdempotencyCoordinator_Lifecycle(t *testing.T) {
 	key := "IDEM_LIFECYCLE_KEY"
 	reqHash := "hash_version_1"
 
-	claim1, err := coord.Claim(ctx, key, reqHash, 100*time.Millisecond)
+	claim1, err := coord.Claim(ctx, key, reqHash, time.Hour)
 	if err != nil || claim1.State != action.IdempotencyClaimAcquired {
 		t.Fatalf("expected Acquired, got state=%v, err=%v", claim1.State, err)
 	}
 
-	claim2, err := coord.Claim(ctx, key, reqHash, 100*time.Millisecond)
+	claim2, err := coord.Claim(ctx, key, reqHash, time.Hour)
 	if err != nil || claim2.State != action.IdempotencyClaimInProgress {
 		t.Fatalf("expected InProgress, got state=%v, err=%v", claim2.State, err)
 	}
 
-	_ = coord.Release(ctx, key, "fake-token")
-	claimAfterFake, _ := coord.Claim(ctx, key, reqHash, 100*time.Millisecond)
+	if err := coord.Release(ctx, key, "fake-token"); err != nil {
+		t.Fatalf("release with fake token: %v", err)
+	}
+	claimAfterFake, err := coord.Claim(ctx, key, reqHash, time.Hour)
+	if err != nil {
+		t.Fatalf("claim after fake release: %v", err)
+	}
 	if claimAfterFake.State != action.IdempotencyClaimInProgress {
 		t.Fatalf("fake token must not release lease")
 	}
 
-	time.Sleep(150 * time.Millisecond)
+	expireTestKVClaim(t, js, "TEST_IDEM_LIFECYCLE", key)
 
 	claim3, err := coord.Claim(ctx, key, reqHash, 2*time.Second)
 	if err != nil || claim3.State != action.IdempotencyClaimAcquired {
@@ -269,6 +274,53 @@ func TestKVIdempotencyCoordinator_Lifecycle(t *testing.T) {
 	}
 	if string(claimDone.Entry.Body) != "SUCCESS_PAYLOAD" {
 		t.Fatalf("unexpected cached body: %s", string(claimDone.Entry.Body))
+	}
+}
+
+func TestKVIdempotencyCoordinatorUsesLogicalTTL(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+
+	const existingBucket = "TEST_IDEM_TTL_MIGRATION"
+	if _, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  existingBucket,
+		History: 1,
+		Storage: nats.FileStorage,
+		TTL:     24 * time.Hour,
+	}); err != nil {
+		t.Fatalf("create existing expiring bucket: %v", err)
+	}
+
+	for _, bucket := range []string{"TEST_IDEM_TTL_NEW", existingBucket} {
+		if _, err := tnats.NewKVIdempotencyCoordinator(js, bucket); err != nil {
+			t.Fatalf("create coordinator for %q: %v", bucket, err)
+		}
+		kv, err := js.KeyValue(bucket)
+		if err != nil {
+			t.Fatalf("open bucket %q: %v", bucket, err)
+		}
+		status, err := kv.Status()
+		if err != nil {
+			t.Fatalf("read bucket status %q: %v", bucket, err)
+		}
+		if status.TTL() != 0 {
+			t.Errorf("bucket %q physical TTL = %s, want no physical expiry", bucket, status.TTL())
+		}
+		streamInfo, err := js.StreamInfo("KV_" + bucket)
+		if err != nil {
+			t.Fatalf("read bucket stream %q: %v", bucket, err)
+		}
+		if streamInfo.Config.MaxAge != 0 {
+			t.Errorf("bucket %q MaxAge = %s, want 0", bucket, streamInfo.Config.MaxAge)
+		}
 	}
 }
 
@@ -297,14 +349,180 @@ func TestKVIdempotencyCoordinator_EntryTTLAndOwnership(t *testing.T) {
 	if err := coord.Complete(ctx, "ttl-key", "wrong-token", entry, time.Second); err == nil {
 		t.Fatal("expected ownership error")
 	}
-	if err := coord.Complete(ctx, "ttl-key", claim.Token, entry, 40*time.Millisecond); err != nil {
+	if err := coord.Complete(ctx, "ttl-key", claim.Token, entry, time.Hour); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 	if done, ok := coord.Get(ctx, "ttl-key"); !ok || string(done.Body) != "body" {
 		t.Fatalf("expected completed entry, got %+v, %v", done, ok)
 	}
-	time.Sleep(60 * time.Millisecond)
+	expireTestKVEntry(t, js, "TEST_IDEM_TTL", "ttl-key")
 	if _, ok := coord.Get(ctx, "ttl-key"); ok {
 		t.Fatal("expired entry was returned")
+	}
+}
+
+func TestKVIdempotencyCoordinatorNoTTLLeaseRenewalAndCorruptEntries(t *testing.T) {
+	t.Parallel()
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	coord, err := tnats.NewKVIdempotencyCoordinator(js, "TEST_IDEM_HARDENED")
+	if err != nil {
+		t.Fatalf("coordinator: %v", err)
+	}
+	ctx := context.Background()
+
+	claim, err := coord.Claim(ctx, "zero-ttl", "hash", time.Hour)
+	if err != nil || claim.State != action.IdempotencyClaimAcquired {
+		t.Fatalf("claim zero-TTL entry: %+v, %v", claim, err)
+	}
+	entry := action.IdempotencyEntry{Status: 200, Body: []byte("permanent"), RequestHash: "hash"}
+	if err := coord.Complete(ctx, "zero-ttl", claim.Token, entry, 0); err != nil {
+		t.Fatalf("complete zero-TTL entry: %v", err)
+	}
+	got, found := coord.Get(ctx, "zero-ttl")
+	if !found || got.Status != entry.Status || !bytes.Equal(got.Body, entry.Body) {
+		t.Fatalf("zero-TTL entry was not decoded: %+v, found=%v", got, found)
+	}
+
+	renewedClaim, err := coord.Claim(ctx, "renew", "hash", time.Hour)
+	if err != nil || renewedClaim.State != action.IdempotencyClaimAcquired {
+		t.Fatalf("claim for renewal: %+v, %v", renewedClaim, err)
+	}
+	kv, err := js.KeyValue("TEST_IDEM_HARDENED")
+	if err != nil {
+		t.Fatalf("open KV bucket: %v", err)
+	}
+	before, err := kv.Get("claim.renew")
+	if err != nil {
+		t.Fatalf("read initial claim: %v", err)
+	}
+	var beforeClaim struct {
+		ExpiresAt int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(before.Value(), &beforeClaim); err != nil {
+		t.Fatalf("decode initial claim: %v", err)
+	}
+	if err := coord.RenewClaim(ctx, "renew", renewedClaim.Token, 2*time.Hour); err != nil {
+		t.Fatalf("renew claim: %v", err)
+	}
+	after, err := kv.Get("claim.renew")
+	if err != nil {
+		t.Fatalf("read renewed claim: %v", err)
+	}
+	var afterClaim struct {
+		ExpiresAt int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(after.Value(), &afterClaim); err != nil {
+		t.Fatalf("decode renewed claim: %v", err)
+	}
+	if afterClaim.ExpiresAt <= beforeClaim.ExpiresAt {
+		t.Fatalf("renewal did not extend expiry: before=%d after=%d", beforeClaim.ExpiresAt, afterClaim.ExpiresAt)
+	}
+	inProgress, err := coord.Claim(ctx, "renew", "hash", time.Hour)
+	if err != nil || inProgress.State != action.IdempotencyClaimInProgress {
+		t.Fatalf("renewed claim must remain owned: %+v, %v", inProgress, err)
+	}
+
+	if _, err := kv.Put("entry.corrupt", []byte("{")); err != nil {
+		t.Fatalf("write corrupt entry fixture: %v", err)
+	}
+	if _, found := coord.Get(ctx, "corrupt"); !found {
+		t.Fatal("corrupt completed entry must fail closed rather than look missing")
+	}
+	if _, err := coord.Claim(ctx, "corrupt", "hash", time.Hour); err == nil {
+		t.Fatal("claim must surface corrupt completed-entry data")
+	}
+	if _, err := kv.Put("claim.corrupt", []byte("{")); err != nil {
+		t.Fatalf("write corrupt claim fixture: %v", err)
+	}
+	if err := coord.Release(ctx, "corrupt", "token"); err == nil {
+		t.Fatal("release must surface corrupt claim data")
+	}
+}
+
+func TestKVIdempotencyCoordinatorReadFailureFailsClosed(t *testing.T) {
+	_, natsURL := runEmbeddedNATS(t)
+	nc, err := nats.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	coord, err := tnats.NewKVIdempotencyCoordinator(js, "TEST_IDEM_DISCONNECTED")
+	if err != nil {
+		t.Fatalf("coordinator: %v", err)
+	}
+	nc.Close()
+
+	ctx := context.Background()
+	if _, found := coord.Get(ctx, "missing"); !found {
+		t.Fatal("backend read failure must not appear as a cache miss")
+	}
+	if _, err := coord.Claim(ctx, "missing", "hash", time.Hour); err == nil {
+		t.Fatal("claim must return a backend error rather than acquire after a failed read")
+	}
+}
+
+func expireTestKVClaim(t *testing.T, js nats.JetStreamContext, bucket, key string) {
+	t.Helper()
+	kv, err := js.KeyValue(bucket)
+	if err != nil {
+		t.Fatalf("open KV bucket %q: %v", bucket, err)
+	}
+	item, err := kv.Get("claim." + key)
+	if err != nil {
+		t.Fatalf("read claim fixture: %v", err)
+	}
+	var payload struct {
+		Token     string `json:"token"`
+		ExpiresAt int64  `json:"exp"`
+	}
+	if err := json.Unmarshal(item.Value(), &payload); err != nil {
+		t.Fatalf("decode claim fixture: %v", err)
+	}
+	payload.ExpiresAt = time.Now().Add(-time.Second).UnixNano()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode expired claim fixture: %v", err)
+	}
+	if _, err := kv.Update("claim."+key, data, item.Revision()); err != nil {
+		t.Fatalf("expire claim fixture: %v", err)
+	}
+}
+
+func expireTestKVEntry(t *testing.T, js nats.JetStreamContext, bucket, key string) {
+	t.Helper()
+	kv, err := js.KeyValue(bucket)
+	if err != nil {
+		t.Fatalf("open KV bucket %q: %v", bucket, err)
+	}
+	item, err := kv.Get("entry." + key)
+	if err != nil {
+		t.Fatalf("read entry fixture: %v", err)
+	}
+	var payload struct {
+		Entry     action.IdempotencyEntry `json:"entry"`
+		ExpiresAt int64                   `json:"exp"`
+	}
+	if err := json.Unmarshal(item.Value(), &payload); err != nil {
+		t.Fatalf("decode entry fixture: %v", err)
+	}
+	payload.ExpiresAt = time.Now().Add(-time.Second).UnixNano()
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode expired entry fixture: %v", err)
+	}
+	if _, err := kv.Update("entry."+key, data, item.Revision()); err != nil {
+		t.Fatalf("expire entry fixture: %v", err)
 	}
 }

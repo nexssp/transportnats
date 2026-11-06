@@ -2,11 +2,12 @@ package tnats
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
-	"sync/atomic"
+	"log/slog"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -27,23 +28,31 @@ type kvClaimPayload struct {
 }
 
 type kvEntryPayload struct {
-	Entry     action.IdempotencyEntry `json:"entry"`
-	ExpiresAt int64                   `json:"exp"`
+	Entry     *action.IdempotencyEntry `json:"entry"`
+	ExpiresAt int64                    `json:"exp"`
 }
-
-var claimSequence atomic.Uint64
 
 // KVIdempotencyCoordinator implements action.IdempotencyCoordinator backed by NATS JetStream KV.
 type KVIdempotencyCoordinator struct {
 	kv nats.KeyValue
 }
 
-var _ action.IdempotencyCoordinator = (*KVIdempotencyCoordinator)(nil)
+var (
+	_ action.IdempotencyCoordinator  = (*KVIdempotencyCoordinator)(nil)
+	_ action.IdempotencyLeaseRenewer = (*KVIdempotencyCoordinator)(nil)
+)
 
 // NewKVIdempotencyCoordinator creates a distributed idempotency coordinator backed by JetStream KV.
 func NewKVIdempotencyCoordinator(js nats.JetStreamContext, bucketName ...string) (*KVIdempotencyCoordinator, error) {
+	if js == nil {
+		return nil, xerr.BadRequest("idempotency JetStream context is required")
+	}
+	if len(bucketName) > 1 {
+		return nil, xerr.BadRequest("at most one idempotency bucket name may be specified")
+	}
+
 	name := defaultIdempotencyBucket
-	if len(bucketName) > 0 && bucketName[0] != "" {
+	if len(bucketName) == 1 && bucketName[0] != "" {
 		name = bucketName[0]
 	}
 
@@ -52,132 +61,237 @@ func NewKVIdempotencyCoordinator(js nats.JetStreamContext, bucketName ...string)
 		kv, err = js.CreateKeyValue(&nats.KeyValueConfig{
 			Bucket:      name,
 			Description: "Nexss Distributed Idempotency Ledger",
-			TTL:         24 * time.Hour,
 			History:     1,
 			Storage:     nats.FileStorage,
 		})
 	}
-
 	if err != nil {
 		return nil, MapError(err)
+	}
+	if err := removeIdempotencyBucketMaxAge(js, kv, name); err != nil {
+		return nil, err
 	}
 
 	return &KVIdempotencyCoordinator{kv: kv}, nil
 }
 
-// Get retrieves a stored response for a completed request.
-func (c *KVIdempotencyCoordinator) Get(_ context.Context, key string) (action.IdempotencyEntry, bool) {
-	entryKey := entryPrefix + key
-
-	item, err := c.kv.Get(entryKey)
+func removeIdempotencyBucketMaxAge(js nats.JetStreamContext, kv nats.KeyValue, name string) error {
+	status, err := kv.Status()
 	if err != nil {
-		return action.IdempotencyEntry{}, false
+		return MapError(err)
+	}
+	if status.TTL() <= 0 {
+		return nil
 	}
 
-	var stored kvEntryPayload
-	if jsonErr := json.Unmarshal(item.Value(), &stored); jsonErr == nil && stored.ExpiresAt != 0 {
-		if time.Now().UnixNano() >= stored.ExpiresAt {
-			return action.IdempotencyEntry{}, false
-		}
-
-		return stored.Entry, true
+	streamInfo, err := js.StreamInfo("KV_" + name)
+	if err != nil {
+		return MapError(err)
 	}
-
-	// Accept entries written by older versions that stored the entry directly.
-	var entry action.IdempotencyEntry
-	if jsonErr := json.Unmarshal(item.Value(), &entry); jsonErr != nil {
-		return action.IdempotencyEntry{}, false
+	streamConfig := streamInfo.Config
+	streamConfig.MaxAge = 0
+	if _, updateErr := js.UpdateStream(&streamConfig); updateErr != nil {
+		return MapError(updateErr)
 	}
-
-	return entry, true
+	status, err = kv.Status()
+	if err != nil {
+		return MapError(err)
+	}
+	if status.TTL() > 0 {
+		return xerr.Internal("idempotency KV bucket still has a physical TTL")
+	}
+	return nil
 }
 
-// Set stores the result in the backend.
-func (c *KVIdempotencyCoordinator) Set(
-	_ context.Context, key string, entry action.IdempotencyEntry, ttl time.Duration,
-) {
-	entryKey := entryPrefix + key
-
-	data, err := marshalKVEntry(entry, ttl)
+// Get retrieves a stored response for a completed request.
+func (c *KVIdempotencyCoordinator) Get(ctx context.Context, key string) (action.IdempotencyEntry, bool) {
+	ctx = idempotencyContext(ctx)
+	entry, found, err := c.loadEntry(ctx, key)
 	if err != nil {
-		return
+		slog.WarnContext(ctx, "idempotency_kv_read_failed", "error", err)
+		return action.IdempotencyEntry{}, true
+	}
+	return entry, found
+}
+
+func (c *KVIdempotencyCoordinator) loadEntry(
+	ctx context.Context, key string,
+) (action.IdempotencyEntry, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return action.IdempotencyEntry{}, false, err
+	}
+	if c == nil || c.kv == nil {
+		return action.IdempotencyEntry{}, false, xerr.Unavailable("idempotency KV coordinator is not initialized")
+	}
+	if key == "" {
+		return action.IdempotencyEntry{}, false, xerr.BadRequest("idempotency key is required")
 	}
 
-	_, _ = c.kv.Put(entryKey, data) //nolint:errcheck // KV put failure surfaces on the next Get
+	item, err := c.kv.Get(entryPrefix + key)
+	if errors.Is(err, nats.ErrKeyNotFound) || errors.Is(err, nats.ErrKeyDeleted) {
+		return action.IdempotencyEntry{}, false, nil
+	}
+	if err != nil {
+		return action.IdempotencyEntry{}, false, mapIdempotencyKVError(ctx, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return action.IdempotencyEntry{}, false, err
+	}
+
+	return decodeKVEntry(item.Value())
+}
+
+// Set implements the Kernel store interface, which has no error return. Failures
+// are logged here; distributed claims use Complete, which returns errors.
+func (c *KVIdempotencyCoordinator) Set(
+	ctx context.Context, key string, entry action.IdempotencyEntry, ttl time.Duration,
+) {
+	ctx = idempotencyContext(ctx)
+	if c == nil || c.kv == nil {
+		slog.ErrorContext(ctx, "idempotency_kv_write_failed", "error", "coordinator is not initialized")
+		return
+	}
+	if key == "" {
+		slog.ErrorContext(ctx, "idempotency_kv_write_failed", "error", xerr.BadRequest("idempotency key is required"))
+		return
+	}
+	data, err := marshalKVEntry(entry, ttl)
+	if err != nil {
+		slog.ErrorContext(ctx, "idempotency_kv_write_failed", "error", err)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		slog.WarnContext(ctx, "idempotency_kv_write_canceled", "error", err)
+		return
+	}
+	if _, err := c.kv.Put(entryPrefix+key, data); err != nil {
+		slog.ErrorContext(ctx, "idempotency_kv_write_failed", "error", MapError(err))
+	}
 }
 
 // Claim atomically reserves an idempotency token in NATS KV.
 func (c *KVIdempotencyCoordinator) Claim(
 	ctx context.Context, key, requestHash string, leaseTTL time.Duration,
 ) (action.IdempotencyClaim, error) {
+	ctx = idempotencyContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return action.IdempotencyClaim{}, err
+	}
+	if c == nil || c.kv == nil {
+		return action.IdempotencyClaim{}, xerr.Unavailable("idempotency KV coordinator is not initialized")
+	}
+	if key == "" {
+		return action.IdempotencyClaim{}, xerr.BadRequest("idempotency key is required")
+	}
+	if leaseTTL <= 0 {
+		leaseTTL = action.DefaultIdempotencyLeaseTTL
+	}
+
+	entry, found, err := c.loadEntry(ctx, key)
+	if err != nil {
+		return action.IdempotencyClaim{}, err
+	}
+	if found {
+		if entry.RequestHash != "" && entry.RequestHash != requestHash {
+			return action.IdempotencyClaim{State: action.IdempotencyClaimConflict}, nil
+		}
+		return action.IdempotencyClaim{State: action.IdempotencyClaimCompleted, Entry: entry}, nil
+	}
+
+	now := time.Now()
+	expiresAt, err := idempotencyExpiry(now, leaseTTL)
+	if err != nil {
+		return action.IdempotencyClaim{}, err
+	}
+	token, err := newKVClaimToken()
+	if err != nil {
+		return action.IdempotencyClaim{}, xerr.Internal("failed to generate idempotency claim token", err)
+	}
+	data, err := json.Marshal(kvClaimPayload{Token: token, RequestHash: requestHash, ExpiresAt: expiresAt})
+	if err != nil {
+		return action.IdempotencyClaim{}, xerr.Internal("failed to marshal idempotency claim", err)
+	}
 	if err := ctx.Err(); err != nil {
 		return action.IdempotencyClaim{}, err
 	}
 
-	if entry, ok := c.Get(ctx, key); ok {
-		if entry.RequestHash != "" && entry.RequestHash != requestHash {
-			return action.IdempotencyClaim{State: action.IdempotencyClaimConflict}, nil
-		}
+	return c.createClaim(ctx, claimPrefix+key, requestHash, token, now, data)
+}
 
-		return action.IdempotencyClaim{
-			State: action.IdempotencyClaimCompleted,
-			Entry: entry,
-		}, nil
-	}
-
-	claimKey := claimPrefix + key
-	now := time.Now().UnixNano()
-	token := strconv.FormatInt(now, 10) + "-" + strconv.FormatUint(claimSequence.Add(1), 10)
-
-	payload := kvClaimPayload{
-		Token:       token,
-		RequestHash: requestHash,
-		ExpiresAt:   now + leaseTTL.Nanoseconds(),
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return action.IdempotencyClaim{}, xerr.Internal("failed to marshal claim", err)
-	}
-
-	// Create succeeds atomically only when the key does not yet exist.
+func (c *KVIdempotencyCoordinator) createClaim(
+	ctx context.Context, claimKey, requestHash, token string, now time.Time, data []byte,
+) (action.IdempotencyClaim, error) {
 	_, createErr := c.kv.Create(claimKey, data)
 	if createErr == nil {
-		return action.IdempotencyClaim{
-			State: action.IdempotencyClaimAcquired,
-			Token: token,
-		}, nil
+		return action.IdempotencyClaim{State: action.IdempotencyClaimAcquired, Token: token}, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return action.IdempotencyClaim{}, ctxErr
 	}
 
 	existing, getErr := c.kv.Get(claimKey)
-	if getErr != nil {
-		if errors.Is(getErr, nats.ErrKeyNotFound) {
-			return action.IdempotencyClaim{State: action.IdempotencyClaimInProgress}, nil
+	if errors.Is(getErr, nats.ErrKeyNotFound) || errors.Is(getErr, nats.ErrKeyDeleted) {
+		if !errors.Is(createErr, nats.ErrKeyExists) {
+			return action.IdempotencyClaim{}, mapIdempotencyKVError(ctx, createErr)
 		}
-
-		return action.IdempotencyClaim{}, MapError(getErr)
+		return c.retryCreateClaim(ctx, claimKey, token, data)
 	}
+	if getErr != nil {
+		return action.IdempotencyClaim{}, mapIdempotencyKVError(ctx, getErr)
+	}
+	return c.resolveExistingClaim(ctx, claimKey, requestHash, token, now, data, existing)
+}
 
+func (c *KVIdempotencyCoordinator) retryCreateClaim(
+	ctx context.Context, claimKey, token string, data []byte,
+) (action.IdempotencyClaim, error) {
+	_, createErr := c.kv.Create(claimKey, data)
+	switch {
+	case createErr == nil:
+		return action.IdempotencyClaim{State: action.IdempotencyClaimAcquired, Token: token}, nil
+	case errors.Is(createErr, nats.ErrKeyExists):
+		return action.IdempotencyClaim{State: action.IdempotencyClaimInProgress}, nil
+	default:
+		return action.IdempotencyClaim{}, mapIdempotencyKVError(ctx, createErr)
+	}
+}
+
+func (c *KVIdempotencyCoordinator) resolveExistingClaim(
+	ctx context.Context, claimKey, requestHash, token string, now time.Time, data []byte, existing nats.KeyValueEntry,
+) (action.IdempotencyClaim, error) {
 	var activeClaim kvClaimPayload
 	if err := json.Unmarshal(existing.Value(), &activeClaim); err != nil {
 		return action.IdempotencyClaim{}, xerr.Internal("corrupted idempotency claim in KV", err)
 	}
-
+	if activeClaim.Token == "" || activeClaim.ExpiresAt <= 0 {
+		return action.IdempotencyClaim{}, xerr.Internal("corrupted idempotency claim in KV")
+	}
 	if activeClaim.RequestHash != "" && activeClaim.RequestHash != requestHash {
 		return action.IdempotencyClaim{State: action.IdempotencyClaimConflict}, nil
 	}
-
-	if now > activeClaim.ExpiresAt {
-		_, updateErr := c.kv.Update(claimKey, data, existing.Revision())
-		if updateErr == nil {
-			return action.IdempotencyClaim{
-				State: action.IdempotencyClaimAcquired,
-				Token: token,
-			}, nil
-		}
+	if now.UnixNano() < activeClaim.ExpiresAt {
+		return action.IdempotencyClaim{State: action.IdempotencyClaimInProgress}, nil
 	}
+	return c.replaceExpiredClaim(ctx, claimKey, token, data, existing.Revision())
+}
 
-	return action.IdempotencyClaim{State: action.IdempotencyClaimInProgress}, nil
+func (c *KVIdempotencyCoordinator) replaceExpiredClaim(
+	ctx context.Context, claimKey, token string, data []byte, revision uint64,
+) (action.IdempotencyClaim, error) {
+	_, updateErr := c.kv.Update(claimKey, data, revision)
+	switch {
+	case updateErr == nil:
+		return action.IdempotencyClaim{State: action.IdempotencyClaimAcquired, Token: token}, nil
+	case errors.Is(updateErr, nats.ErrKeyRevisionMismatch):
+		return action.IdempotencyClaim{State: action.IdempotencyClaimInProgress}, nil
+	case errors.Is(updateErr, nats.ErrKeyNotFound), errors.Is(updateErr, nats.ErrKeyDeleted):
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return action.IdempotencyClaim{}, ctxErr
+		}
+		return c.retryCreateClaim(ctx, claimKey, token, data)
+	default:
+		return action.IdempotencyClaim{}, mapIdempotencyKVError(ctx, updateErr)
+	}
 }
 
 // Complete writes the result before releasing the claim, then removes only the
@@ -185,79 +299,245 @@ func (c *KVIdempotencyCoordinator) Claim(
 func (c *KVIdempotencyCoordinator) Complete(
 	ctx context.Context, key, token string, entry action.IdempotencyEntry, ttl time.Duration,
 ) error {
+	ctx = idempotencyContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	claimKey := claimPrefix + key
-
-	item, err := c.kv.Get(claimKey)
+	if c == nil || c.kv == nil {
+		return xerr.Unavailable("idempotency KV coordinator is not initialized")
+	}
+	if key == "" || token == "" {
+		return xerr.BadRequest("idempotency key and claim token are required")
+	}
+	entryData, err := marshalKVEntry(entry, ttl)
 	if err != nil {
-		return MapError(err)
+		return err
 	}
-
-	var activeClaim kvClaimPayload
-	if jsonErr := json.Unmarshal(item.Value(), &activeClaim); jsonErr != nil {
-		return xerr.Internal("corrupted idempotency claim in KV", jsonErr)
-	}
-
-	if activeClaim.Token != token {
-		return xerr.Conflict("idempotency claim is owned by another token")
-	}
-
-	data, err := marshalKVEntry(entry, ttl)
+	claimRevision, err := c.extendClaimForCompletion(ctx, key, token)
 	if err != nil {
-		return xerr.Internal("failed to marshal idempotency entry", err)
+		return err
 	}
-
-	if _, err = c.kv.Put(entryPrefix+key, data); err != nil {
-		return MapError(err)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	if err := c.kv.Delete(claimKey, nats.LastRevision(item.Revision())); err != nil {
-		return MapError(err)
+	if _, err := c.kv.Put(entryPrefix+key, entryData); err != nil {
+		return mapIdempotencyKVError(ctx, err)
 	}
-
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.kv.Delete(claimPrefix+key, nats.LastRevision(claimRevision)); err != nil {
+		return mapIdempotencyKVError(ctx, err)
+	}
 	return nil
 }
 
-// Release frees the reservation after a failure or panic. Release is
-// best-effort: corrupted claim data cannot be safely deleted by token, so it
-// is left in place and expires naturally through the lease TTL.
-func (c *KVIdempotencyCoordinator) Release(_ context.Context, key, token string) error {
+func (c *KVIdempotencyCoordinator) extendClaimForCompletion(
+	ctx context.Context, key, token string,
+) (uint64, error) {
 	claimKey := claimPrefix + key
-
 	item, err := c.kv.Get(claimKey)
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
+		return 0, mapIdempotencyKVError(ctx, err)
+	}
+	var activeClaim kvClaimPayload
+	if decodeErr := json.Unmarshal(item.Value(), &activeClaim); decodeErr != nil {
+		return 0, xerr.Internal("corrupted idempotency claim in KV", decodeErr)
+	}
+	if activeClaim.Token == "" || activeClaim.ExpiresAt <= 0 {
+		return 0, xerr.Internal("corrupted idempotency claim in KV")
+	}
+	if activeClaim.Token != token {
+		return 0, xerr.Conflict("idempotency claim is owned by another token")
+	}
+	now := time.Now()
+	if now.UnixNano() >= activeClaim.ExpiresAt {
+		return 0, xerr.Conflict("idempotency claim has expired")
+	}
+	expiresAt, err := idempotencyExpiry(now, action.DefaultIdempotencyLeaseTTL)
+	if err != nil {
+		return 0, err
+	}
+	activeClaim.ExpiresAt = expiresAt
+	claimData, err := json.Marshal(activeClaim)
+	if err != nil {
+		return 0, xerr.Internal("failed to marshal idempotency claim", err)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return 0, ctxErr
+	}
+	claimInfo, err := c.kv.Update(claimKey, claimData, item.Revision())
+	if err != nil {
+		return 0, mapIdempotencyKVError(ctx, err)
+	}
+	return claimInfo, nil
+}
+
+// Release frees the reservation after a failure or panic and returns cleanup errors.
+func (c *KVIdempotencyCoordinator) Release(ctx context.Context, key, token string) error {
+	ctx = idempotencyContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c == nil || c.kv == nil {
+		return xerr.Unavailable("idempotency KV coordinator is not initialized")
+	}
+	if key == "" || token == "" {
+		return xerr.BadRequest("idempotency key and claim token are required")
+	}
+
+	claimKey := claimPrefix + key
+	item, err := c.kv.Get(claimKey)
+	if errors.Is(err, nats.ErrKeyNotFound) || errors.Is(err, nats.ErrKeyDeleted) {
+		return nil
+	}
+	if err != nil {
+		return mapIdempotencyKVError(ctx, err)
+	}
+	var activeClaim kvClaimPayload
+	if err := json.Unmarshal(item.Value(), &activeClaim); err != nil {
+		return xerr.Internal("corrupted idempotency claim in KV", err)
+	}
+	if activeClaim.Token == token {
+		err := c.kv.Delete(claimKey, nats.LastRevision(item.Revision()))
+		if errors.Is(err, nats.ErrKeyNotFound) || errors.Is(err, nats.ErrKeyDeleted) {
 			return nil
 		}
-
-		return MapError(err)
+		return mapIdempotencyKVError(ctx, err)
 	}
-
-	var activeClaim kvClaimPayload
-	if jsonErr := json.Unmarshal(item.Value(), &activeClaim); jsonErr != nil {
-		return nil //nolint:nilerr // corrupted claim data cannot be safely released; lease expires naturally
-	}
-
-	if activeClaim.Token == token {
-		return MapError(c.kv.Delete(claimKey, nats.LastRevision(item.Revision())))
-	}
-
 	return nil
 }
 
 func marshalKVEntry(entry action.IdempotencyEntry, ttl time.Duration) ([]byte, error) {
-	expiresAt := int64(0)
-	if ttl > 0 {
-		expiresAt = time.Now().Add(ttl).UnixNano()
+	expiresAt, err := idempotencyExpiry(time.Now(), ttl)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(kvEntryPayload{Entry: &entry, ExpiresAt: expiresAt})
+}
+
+func decodeKVEntry(data []byte) (action.IdempotencyEntry, bool, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil {
+		return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV", err)
+	}
+	if _, wrapped := object["entry"]; wrapped {
+		var stored kvEntryPayload
+		if err := json.Unmarshal(data, &stored); err != nil {
+			return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV", err)
+		}
+		if stored.Entry == nil {
+			return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV")
+		}
+		if stored.ExpiresAt != 0 && time.Now().UnixNano() >= stored.ExpiresAt {
+			return action.IdempotencyEntry{}, false, nil
+		}
+		return *stored.Entry, true, nil
 	}
 
-	return json.Marshal(kvEntryPayload{Entry: entry, ExpiresAt: expiresAt})
+	var legacy action.IdempotencyEntry
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return action.IdempotencyEntry{}, true, xerr.Internal("corrupted legacy idempotency entry in KV", err)
+	}
+	return legacy, true, nil
+}
+
+func idempotencyExpiry(now time.Time, ttl time.Duration) (int64, error) {
+	if ttl <= 0 {
+		return 0, nil
+	}
+	const maxUnixNano = int64(1<<63 - 1)
+	if ttl > time.Unix(0, maxUnixNano).Sub(now) {
+		return 0, xerr.BadRequest("idempotency TTL is too large")
+	}
+	return now.Add(ttl).UnixNano(), nil
+}
+
+func mapIdempotencyKVError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return MapError(err)
+}
+
+func idempotencyContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func newKVClaimToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(token[:]), nil
+}
+
+// RenewClaim extends the lease of a running distributed idempotent action.
+func (c *KVIdempotencyCoordinator) RenewClaim(ctx context.Context, key, token string, leaseTTL time.Duration) error {
+	ctx = idempotencyContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c == nil || c.kv == nil {
+		return xerr.Unavailable("idempotency KV coordinator is not initialized")
+	}
+	if key == "" || token == "" {
+		return xerr.BadRequest("idempotency key and claim token are required")
+	}
+	if leaseTTL <= 0 {
+		leaseTTL = action.DefaultIdempotencyLeaseTTL
+	}
+
+	claimKey := claimPrefix + key
+	item, err := c.kv.Get(claimKey)
+	if err != nil {
+		return mapIdempotencyKVError(ctx, err)
+	}
+	var activeClaim kvClaimPayload
+	if decodeErr := json.Unmarshal(item.Value(), &activeClaim); decodeErr != nil {
+		return xerr.Internal("corrupted idempotency claim in KV", decodeErr)
+	}
+	if activeClaim.Token == "" || activeClaim.ExpiresAt <= 0 {
+		return xerr.Internal("corrupted idempotency claim in KV")
+	}
+	if activeClaim.Token != token {
+		return xerr.Conflict("idempotency claim is owned by another token")
+	}
+	now := time.Now()
+	if now.UnixNano() >= activeClaim.ExpiresAt {
+		return xerr.Conflict("idempotency claim has expired")
+	}
+	expiresAt, err := idempotencyExpiry(now, leaseTTL)
+	if err != nil {
+		return err
+	}
+	activeClaim.ExpiresAt = expiresAt
+	data, err := json.Marshal(activeClaim)
+	if err != nil {
+		return xerr.Internal("failed to marshal idempotency claim", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := c.kv.Update(claimKey, data, item.Revision()); err != nil {
+		return mapIdempotencyKVError(ctx, err)
+	}
+	return nil
 }
 
 func EnsureIdempotencyBucket(js nats.JetStreamContext, name string, ttl time.Duration) error {
+	if js == nil {
+		return xerr.BadRequest("idempotency JetStream context is required")
+	}
+	if name == "" {
+		return xerr.BadRequest("idempotency bucket name is required")
+	}
+	if ttl < 0 {
+		return xerr.BadRequest("idempotency bucket TTL must not be negative")
+	}
 	_, err := js.CreateKeyValue(&nats.KeyValueConfig{
 		Bucket:      name,
 		Description: "Nexss Distributed Idempotency Ledger",
@@ -265,8 +545,7 @@ func EnsureIdempotencyBucket(js nats.JetStreamContext, name string, ttl time.Dur
 		Storage:     nats.FileStorage,
 	})
 	if err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
-		return fmt.Errorf("tnats: failed to ensure idempotency bucket: %w", err)
+		return MapError(fmt.Errorf("tnats: failed to ensure idempotency bucket: %w", err))
 	}
-
 	return nil
 }

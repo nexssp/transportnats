@@ -3,6 +3,7 @@ package tnats
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nexssp/kernel/action"
@@ -25,6 +26,9 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 		return nil, errors.New("nats transport is already running")
 	}
 	defer t.running.Store(false)
+	t.mu.Lock()
+	t.closing = false
+	t.mu.Unlock()
 
 	t.mu.RLock()
 	initErr := t.initErr
@@ -62,22 +66,27 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 		runCancel()
 
 		t.mu.Lock()
-		for _, svc := range t.microServices {
-			_ = svc.Stop() //nolint:errcheck // shutdown path
-		}
+		t.closing = true
+		services := t.microServices
 		t.microServices = nil
-		t.mu.Unlock()
-
-		t.mu.Lock()
 		subs := t.subs
 		t.subs = nil
 		t.mu.Unlock()
-		for _, s := range subs {
-			_ = s.Unsubscribe() //nolint:errcheck // shutdown path
+		for _, svc := range services {
+			if err := svc.Stop(); err != nil {
+				t.log.Warn("nats_micro_service_stop_failed", "error", MapError(err))
+			}
+		}
+		for _, sub := range subs {
+			if err := sub.Unsubscribe(); err != nil {
+				t.log.Warn("nats_subscription_unsubscribe_failed", "error", MapError(err))
+			}
 		}
 
 		t.workersWg.Wait()
-		_ = t.Close()
+		if err := t.Close(); err != nil {
+			t.log.Warn("nats_transport_close_failed", "error", MapError(err))
+		}
 	}()
 
 	t.mu.RLock()
@@ -133,9 +142,9 @@ func (t *Transport) mountActions(
 
 			switch binding := b.(type) {
 			case TopicBinding:
-				err = t.subscribeTopic(ctx, nc, ex, binding, meta)
+				err = t.subscribeTopic(ctx, nc, ex, binding, meta, 0)
 			case RequestBinding:
-				err = t.subscribeTopic(ctx, nc, ex, TopicBinding{Subject: binding.Subject}, meta)
+				err = t.subscribeTopic(ctx, nc, ex, TopicBinding{Subject: binding.Subject}, meta, binding.Timeout)
 			case KVBinding:
 				err = t.mountKV(ctx, js, ex, binding)
 			case DurableBinding:
@@ -161,14 +170,22 @@ func (t *Transport) mountActions(
 
 func (t *Transport) subscribeTopic(
 	ctx context.Context, nc *nats.Conn, ex action.Executable,
-	b TopicBinding, meta *action.Meta,
+	b TopicBinding, meta *action.Meta, handlerTimeout time.Duration,
 ) error {
 	handler := func(msg *nats.Msg) {
-		t.workersWg.Add(1)
+		if !t.startWorker() {
+			return
+		}
 		go func(m *nats.Msg) {
 			defer t.workersWg.Done()
+			callCtx := ctx
+			if handlerTimeout > 0 {
+				var cancel context.CancelFunc
+				callCtx, cancel = context.WithTimeout(ctx, handlerTimeout)
+				defer cancel()
+			}
 
-			reqCtx, scope, release := xctx.NewScope(ctx)
+			reqCtx, scope, release := xctx.NewScope(callCtx)
 			defer release()
 
 			scope.Endpoint = "nats." + m.Subject
@@ -191,12 +208,11 @@ func (t *Transport) subscribeTopic(
 			} else {
 				res, execErr := ex.ExecuteDecoded(reqCtx, decoder)
 				if execErr != nil {
-					replyBytes, _ = encodeError(t.codec, execErr) //nolint:errcheck // original err is returned to caller
-					err = execErr
+					replyBytes, err = encodeError(t.codec, execErr)
 				} else {
 					replyBytes, err = t.codec.Marshal(res)
 					if err != nil {
-						replyBytes, _ = encodeError(t.codec, xerr.Internal("failed to marshal response", err)) //nolint:errcheck // original err is returned to caller
+						replyBytes, err = encodeError(t.codec, xerr.Internal("failed to marshal response", err))
 					}
 				}
 			}
@@ -210,7 +226,9 @@ func (t *Transport) subscribeTopic(
 				if err != nil {
 					reply.Header.Set(HeaderErrorMarker, "1")
 				}
-				_ = nc.PublishMsg(reply) //nolint:errcheck // reply is best-effort; failure surfaces as requester timeout
+				if publishErr := nc.PublishMsg(reply); publishErr != nil {
+					t.log.Error("nats_reply_publish_failed", "subject", m.Subject, "error", MapError(publishErr))
+				}
 			} else if err != nil {
 				t.log.Error("nats_topic_action_failed", "subject", m.Subject, "error", err)
 			}

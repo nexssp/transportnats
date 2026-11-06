@@ -32,7 +32,9 @@ func StartEmbedded(t *testing.T, jetStream bool) *EmbeddedServer {
 	}
 	port := addr.Port
 
-	_ = l.Close()
+	if closeErr := l.Close(); closeErr != nil {
+		t.Fatalf("testkit: release reserved port: %v", closeErr)
+	}
 
 	opts := &natsserver.Options{
 		Host:      "127.0.0.1",
@@ -77,10 +79,10 @@ func RunContract(t *testing.T, newTransport func(t *testing.T, url string) *tnat
 	srv := StartEmbedded(t, false)
 	tr := newTransport(t, srv.URL)
 
-	done := make(chan struct{}, 1)
+	actionDone := make(chan struct{}, 1)
 	act := action.New("contract.ping", func(_ context.Context, _ map[string]string) (string, error) {
 		select {
-		case done <- struct{}{}:
+		case actionDone <- struct{}{}:
 		default:
 		}
 
@@ -90,9 +92,22 @@ func RunContract(t *testing.T, newTransport func(t *testing.T, url string) *tnat
 	tr.Mount([]action.AnyAction{act})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() { _, _ = tr.Do(ctx, nil) }() //nolint:errcheck // test goroutine; failures surface via WaitReady
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := tr.Do(ctx, nil)
+		runDone <- err
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Errorf("contract transport stopped with error: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("contract transport did not stop after cancellation")
+		}
+	}()
 
 	if err := tr.WaitReady(ctx); err != nil {
 		t.Fatalf("WaitReady: %v", err)
@@ -103,7 +118,7 @@ func RunContract(t *testing.T, newTransport func(t *testing.T, url string) *tnat
 	}
 
 	select {
-	case <-done:
+	case <-actionDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("contract: no message received within deadline")
 	}

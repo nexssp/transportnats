@@ -28,8 +28,26 @@ func TestObjectStore_ExceedsMaxBytes_ReturnsError(t *testing.T) {
 	}
 	defer nc.Close()
 
-	js, _ := nc.JetStream()
-	_, _ = js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "STRICT_BUCKET"})
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
+	if _, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "STRICT_BUCKET"}); err != nil {
+		t.Fatalf("create object store: %v", err)
+	}
+	var failureCount atomic.Int32
+	receivedObject := make(chan struct{}, 1)
+	objAct := action.New("obj.strict", func(_ context.Context, ev tnats.ObjectEvent) (string, error) {
+		if len(ev.Data) == 0 {
+			failureCount.Add(1)
+		}
+		select {
+		case receivedObject <- struct{}{}:
+		default:
+		}
+		return "ok", nil
+	}).Route(tnats.ObjectStore("STRICT_BUCKET", ">").WithData(50 * 1024)).Build()
+	tr.Mount([]action.AnyAction{objAct})
 
 	go func() { _, _ = tr.Do(ctx, nil) }()
 	if err := tr.WaitReady(ctx); err != nil {
@@ -40,17 +58,14 @@ func TestObjectStore_ExceedsMaxBytes_ReturnsError(t *testing.T) {
 	if _, err := tr.PutObject(ctx, "STRICT_BUCKET", "large.bin", payload); err != nil {
 		t.Fatalf("PutObject failed: %v", err)
 	}
-
-	var failureCount atomic.Int32
-	objAct := action.New("obj.strict", func(_ context.Context, ev tnats.ObjectEvent) (string, error) {
-		if len(ev.Data) == 0 {
-			failureCount.Add(1)
-		}
-
-		return "ok", nil
-	}).Route(tnats.ObjectStore("STRICT_BUCKET", ">").WithData(50 * 1024)).Build()
-
-	tr.Mount([]action.AnyAction{objAct})
+	select {
+	case <-receivedObject:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for ObjectStore event")
+	}
+	if failureCount.Load() != 1 {
+		t.Fatalf("oversized object event should omit data, got %d failures", failureCount.Load())
+	}
 
 	_, getErr := tr.GetObject(ctx, "STRICT_BUCKET", "large.bin")
 	if getErr != nil {
@@ -63,11 +78,13 @@ func TestConsumer_MultiFilter_HappyPath(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
 
 	var receivedCount atomic.Int32
+	received := make(chan struct{}, 2)
 	multiBinding := tnats.Consumer("MULTI_STREAM", "events.orders.eu", "multi-filter-worker").
 		WithFilters("events.orders.eu", "events.orders.us")
 
 	multiAct := action.New("orders.multifilter", func(_ context.Context, _ OrderReq) (string, error) {
 		receivedCount.Add(1)
+		received <- struct{}{}
 
 		return "ok", nil
 	}).Route(multiBinding).Build()
@@ -83,11 +100,19 @@ func TestConsumer_MultiFilter_HappyPath(t *testing.T) {
 	}
 
 	nc := tr.Conn()
-	js, _ := nc.JetStream()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
+	}
 
-	d1, _ := json.Marshal(OrderReq{ID: "EU-1", Price: 100})
-	d2, _ := json.Marshal(OrderReq{ID: "US-1", Price: 200})
-	dIgnored, _ := json.Marshal(OrderReq{ID: "ASIA-1", Price: 300})
+	d1, err := json.Marshal(OrderReq{ID: "EU-1", Price: 100})
+	if err != nil {
+		t.Fatalf("marshal EU request: %v", err)
+	}
+	d2, err := json.Marshal(OrderReq{ID: "US-1", Price: 200})
+	if err != nil {
+		t.Fatalf("marshal US request: %v", err)
+	}
 
 	if _, err := js.Publish("events.orders.eu", d1); err != nil {
 		t.Fatalf("publish EU: %v", err)
@@ -95,15 +120,23 @@ func TestConsumer_MultiFilter_HappyPath(t *testing.T) {
 	if _, err := js.Publish("events.orders.us", d2); err != nil {
 		t.Fatalf("publish US: %v", err)
 	}
-	_, _ = js.Publish("events.orders.asia", dIgnored)
-
-	deadline := time.Now().Add(3 * time.Second)
-	for receivedCount.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	for range 2 {
+		select {
+		case <-received:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for matching consumer event")
+		}
 	}
 
 	if count := receivedCount.Load(); count != 2 {
 		t.Fatalf("expected exactly 2 matching multi-filter events, got %d", count)
+	}
+	info, err := js.ConsumerInfo("MULTI_STREAM", "multi-filter-worker")
+	if err != nil {
+		t.Fatalf("consumer info: %v", err)
+	}
+	if len(info.Config.FilterSubjects) != 2 || info.Config.FilterSubjects[0] != "events.orders.eu" || info.Config.FilterSubjects[1] != "events.orders.us" {
+		t.Fatalf("unexpected consumer filter subjects: %v", info.Config.FilterSubjects)
 	}
 }
 
@@ -112,6 +145,7 @@ func TestConsumer_PoisonPillWithoutDLQ_Terminates(t *testing.T) {
 	_, natsURL := runEmbeddedNATS(t)
 
 	var deliveries atomic.Int32
+	seenDelivery := make(chan struct{}, 3)
 	binding := tnats.Consumer("POISON_STREAM", "poison.subject", "poison-worker").
 		NewOnly().
 		WithBackOff(10*time.Millisecond, 20*time.Millisecond)
@@ -119,6 +153,10 @@ func TestConsumer_PoisonPillWithoutDLQ_Terminates(t *testing.T) {
 
 	failAct := action.New("poison.action", func(_ context.Context, _ OrderReq) (string, error) {
 		deliveries.Add(1)
+		select {
+		case seenDelivery <- struct{}{}:
+		default:
+		}
 
 		return "", errors.New("unrecoverable database corruption")
 	}).Route(binding).Build()
@@ -134,17 +172,27 @@ func TestConsumer_PoisonPillWithoutDLQ_Terminates(t *testing.T) {
 	}
 
 	nc := tr.Conn()
-	js, _ := nc.JetStream()
-
-	payload, _ := json.Marshal(OrderReq{ID: "POISON-1", Price: 1})
-	_, _ = js.Publish("poison.subject", payload)
-
-	deadline := time.Now().Add(2 * time.Second)
-	for deliveries.Load() < 3 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("jetstream: %v", err)
 	}
 
-	if got := deliveries.Load(); got > 3 {
-		t.Fatalf("poison pill was delivered %d times; expected to terminate at 3", got)
+	payload, err := json.Marshal(OrderReq{ID: "POISON-1", Price: 1})
+	if err != nil {
+		t.Fatalf("marshal poison request: %v", err)
+	}
+	if _, err := js.Publish("poison.subject", payload); err != nil {
+		t.Fatalf("publish poison request: %v", err)
+	}
+	for range 3 {
+		select {
+		case <-seenDelivery:
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for poison-message delivery")
+		}
+	}
+
+	if got := deliveries.Load(); got != 3 {
+		t.Fatalf("poison pill was delivered %d times; expected 3 attempts", got)
 	}
 }

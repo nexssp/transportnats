@@ -46,6 +46,13 @@ func TestBundleRegistersAndBuildsWithCurrentFlow(t *testing.T) {
 	}
 }
 
+func TestLibraryConfigDefaultsAreNormalized(t *testing.T) {
+	cfg := normalizeConfig(Config{})
+	if cfg.URL != "nats://127.0.0.1:4222" || cfg.Name != "nflow-client" || cfg.Timeout != 5*time.Second {
+		t.Fatalf("normalized zero config = %#v, want default URL, name, and 5s timeout", cfg)
+	}
+}
+
 func TestNATSRequestModifierCreatesRequestBinding(t *testing.T) {
 	modifierTable := compiler.NewModifierTable(Modifiers()...)
 	base := action.New("inventory.check", func(_ context.Context, req any) (any, error) {
@@ -67,6 +74,65 @@ func TestNATSRequestModifierCreatesRequestBinding(t *testing.T) {
 	}
 	if binding.Subject != "inventory.check" {
 		t.Fatalf("subject = %q, want inventory.check", binding.Subject)
+	}
+}
+
+func TestNATSRPCModifierCreatesRequestBinding(t *testing.T) {
+	modifierTable := compiler.NewModifierTable(Modifiers()...)
+	base := action.New("inventory.check", func(_ context.Context, req any) (any, error) {
+		return req, nil
+	}).Build()
+
+	modified, err := modifierTable.ApplyAll(base, []string{"nats-rpc=inventory.check"})
+	if err != nil {
+		t.Fatalf("apply nats-rpc modifier: %v", err)
+	}
+	bindings := modified.GetBindings()
+	if len(bindings) != 1 {
+		t.Fatalf("binding count = %d, want 1", len(bindings))
+	}
+	binding, ok := bindings[0].(tnats.RequestBinding)
+	if !ok || binding.Subject != "inventory.check" {
+		t.Fatalf("binding = %#v, want request binding for inventory.check", bindings[0])
+	}
+}
+
+func TestNATSObjectModifierRequiresSeparator(t *testing.T) {
+	modifierTable := compiler.NewModifierTable(Modifiers()...)
+	base := action.New("objects.watch", func(_ context.Context, req any) (any, error) {
+		return req, nil
+	}).Build()
+
+	modified, err := modifierTable.ApplyAll(base, []string{"nats_object=ORDERS"})
+	if err != nil {
+		t.Fatalf("apply nats_object modifier: %v", err)
+	}
+	bindings := modified.GetBindings()
+	if len(bindings) != 1 {
+		t.Fatalf("binding count = %d, want 1", len(bindings))
+	}
+	if _, ok := bindings[0].(invalidBinding); !ok {
+		t.Fatalf("binding = %T, want invalidBinding for missing separator", bindings[0])
+	}
+}
+
+func TestNATSObjectModifierAllowsEmptyWatchAllPattern(t *testing.T) {
+	modifierTable := compiler.NewModifierTable(Modifiers()...)
+	base := action.New("objects.watch", func(_ context.Context, req any) (any, error) {
+		return req, nil
+	}).Build()
+
+	modified, err := modifierTable.ApplyAll(base, []string{"nats_object=ORDERS:"})
+	if err != nil {
+		t.Fatalf("apply nats_object modifier: %v", err)
+	}
+	bindings := modified.GetBindings()
+	if len(bindings) != 1 {
+		t.Fatalf("binding count = %d, want 1", len(bindings))
+	}
+	binding, ok := bindings[0].(tnats.ObjectBinding)
+	if !ok || binding.Bucket != "ORDERS" || binding.Pattern != "" {
+		t.Fatalf("binding = %#v, want ORDERS with an empty watch-all pattern", bindings[0])
 	}
 }
 

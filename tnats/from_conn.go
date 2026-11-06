@@ -15,6 +15,7 @@ import (
 func FromConn(nc *nats.Conn) *Transport {
 	t := &Transport{
 		codec:          codec.Default,
+		providedConn:   true,
 		idemStore:      action.NewMemoryIdempotencyStore(0),
 		fetchBatchSize: 1,
 		fetchTimeout:   time.Second,

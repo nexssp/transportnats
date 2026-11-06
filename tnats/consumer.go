@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -145,9 +146,38 @@ func validateConsumerBinding(b ConsumerBinding) error {
 	if b.MaxDeliver <= 0 || b.AckWait <= 0 || b.MaxAckPending <= 0 {
 		return xerr.BadRequest("consumer delivery parameters must be positive")
 	}
+	if b.AckPolicy == AckNone && b.DeadLetterSubject != "" {
+		return xerr.BadRequest("consumer dead-lettering requires an acknowledgement policy that supports redelivery")
+	}
+	switch b.DeliverPolicy {
+	case DeliverAll, DeliverLast, DeliverNew, DeliverByStartSequence, DeliverByStartTime, DeliverLastPerSubject:
+	default:
+		return xerr.BadRequest("consumer delivery policy is invalid")
+	}
+	switch b.AckPolicy {
+	case AckExplicit, AckNone, AckAll:
+	default:
+		return xerr.BadRequest("consumer acknowledgement policy is invalid")
+	}
+	switch b.ReplayPolicy {
+	case ReplayInstant, ReplayOriginal:
+	default:
+		return xerr.BadRequest("consumer replay policy is invalid")
+	}
+	if b.DeliverPolicy == DeliverByStartSequence && b.OptStartSeq == 0 {
+		return xerr.BadRequest("consumer start sequence must be positive")
+	}
+	if b.DeliverPolicy == DeliverByStartTime && b.OptStartTime.IsZero() {
+		return xerr.BadRequest("consumer start time is required")
+	}
 
-	if len(b.BackOff) > 0 && len(b.BackOff) >= b.MaxDeliver {
-		return xerr.BadRequest("consumer backoff length must be < MaxDeliver")
+	if len(b.BackOff) > b.MaxDeliver {
+		return xerr.BadRequest("consumer backoff length must not exceed MaxDeliver")
+	}
+	for _, delay := range b.BackOff {
+		if delay <= 0 {
+			return xerr.BadRequest("consumer backoff delays must be positive")
+		}
 	}
 
 	return nil
@@ -189,7 +219,11 @@ func (t *Transport) runFetchLoop(
 	ctx context.Context, nc *nats.Conn, sub *nats.Subscription, handle func(*nats.Msg),
 ) {
 	defer t.workersWg.Done()
-	defer func() { _ = sub.Unsubscribe() }() //nolint:errcheck // unsubscribe on shutdown is best-effort
+	defer func() {
+		if err := sub.Unsubscribe(); err != nil {
+			t.log.Warn("nats_pull_subscription_unsubscribe_failed", "error", MapError(err))
+		}
+	}()
 
 	for {
 		if ctx.Err() != nil {
@@ -210,6 +244,7 @@ func (t *Transport) runFetchLoop(
 				return
 			}
 
+			t.log.Warn("nats_pull_fetch_failed", "error", MapError(err), "retry_delay", 50*time.Millisecond)
 			select {
 			case <-time.After(50 * time.Millisecond):
 			case <-ctx.Done():
@@ -291,7 +326,7 @@ func (t *Transport) openConsumerSubscription(js nats.JetStreamContext, b Consume
 	opts := []nats.SubOpt{
 		nats.BindStream(b.Stream),
 		nats.AckWait(b.AckWait),
-		nats.MaxDeliver(b.MaxDeliver),
+		nats.MaxDeliver(-1), // Application code enforces MaxDeliver; NATS must allow DLQ retries.
 		nats.MaxAckPending(b.MaxAckPending),
 	}
 
@@ -324,8 +359,31 @@ func (t *Transport) openConsumerSubscription(js nats.JetStreamContext, b Consume
 	if err != nil {
 		return nil, MapError(err)
 	}
+	if err := ensureUnlimitedConsumerDeliveries(js, b.Stream, b.Durable); err != nil {
+		if unsubscribeErr := sub.Unsubscribe(); unsubscribeErr != nil {
+			t.log.Warn("nats_pull_subscription_unsubscribe_failed", "error", MapError(unsubscribeErr))
+		}
+		return nil, err
+	}
 
 	return sub, nil
+}
+
+func ensureUnlimitedConsumerDeliveries(js nats.JetStreamContext, stream, durable string) error {
+	info, err := js.ConsumerInfo(stream, durable)
+	if err != nil {
+		return MapError(err)
+	}
+	if info.Config.MaxDeliver == -1 {
+		return nil
+	}
+
+	config := info.Config
+	config.MaxDeliver = -1
+	if _, err := js.UpdateConsumer(stream, &config); err != nil {
+		return MapError(err)
+	}
+	return nil
 }
 
 func (t *Transport) handleConsumerMessage(
@@ -346,6 +404,33 @@ func (t *Transport) handleConsumerMessage(
 		return t.codec.Unmarshal(msg.Data, v)
 	}
 
+	deliveries := uint64(1)
+	if b.AckPolicy != AckNone {
+		metaInfo, metadataErr := msg.Metadata()
+		if metadataErr != nil {
+			t.log.Warn("consumer_metadata_failed", "subject", msg.Subject, "error", MapError(metadataErr))
+			ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
+			t.nakConsumerMessage(ackCtx, b, msg, deliveries, MapError(metadataErr))
+			cancel()
+			return
+		}
+		deliveries = metaInfo.NumDelivered
+		if maxDeliverExceeded(deliveries, b.MaxDeliver) {
+			ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
+			defer cancel()
+			exceededErr := xerr.Internal("consumer delivery limit exceeded; retrying dead-letter handling")
+			if b.DeadLetterSubject != "" {
+				if deadLetterErr := t.dlqConsumerMessage(ackCtx, js, b, msg, exceededErr, deliveries, true); deadLetterErr != nil {
+					t.log.Error("consumer_dead_letter_failed", "subject", msg.Subject, "error", deadLetterErr)
+					t.nakConsumerMessage(ackCtx, b, msg, deliveries, deadLetterErr)
+				}
+			} else if termErr := msg.Term(nats.Context(ackCtx)); termErr != nil {
+				t.log.Error("consumer_term_failed", "subject", msg.Subject, "error", MapError(termErr))
+			}
+			return
+		}
+	}
+
 	var execErr error
 	if meta != nil && meta.Idempotency.Enabled {
 		_, execErr = executeWithIdempotency(reqCtx, t.idemStore, meta.Idempotency, ex, msg, decoder, t.codec)
@@ -361,41 +446,103 @@ func (t *Transport) handleConsumerMessage(
 		ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
 		defer cancel()
 
-		_ = msg.AckSync(nats.Context(ackCtx)) //nolint:errcheck // ack failure is not recoverable by the handler
-
-		return
-	}
-
-	metaInfo, mErr := msg.Metadata()
-	if mErr == nil && b.MaxDeliver > 0 && metaInfo.NumDelivered >= uint64(b.MaxDeliver) {
-		if b.DeadLetterSubject != "" {
-			t.dlqConsumerMessage(js, b, msg, execErr, metaInfo.NumDelivered)
-		} else {
-			_ = msg.Term() //nolint:errcheck // terminal state; no retry possible
+		if err := msg.AckSync(nats.Context(ackCtx)); err != nil {
+			t.log.Error("consumer_ack_failed", "subject", msg.Subject, "error", MapError(err))
 		}
 
 		return
 	}
 
-	// When BackOff is defined, let the JetStream engine drive retry intervals.
-	if len(b.BackOff) > 0 {
-		_ = msg.Nak() //nolint:errcheck // NAck failure falls back to AckWait redelivery
+	t.log.Error("consumer_action_failed", "subject", msg.Subject, "error", execErr)
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
+	defer cancel()
+
+	if b.AckPolicy == AckNone {
+		if b.DeadLetterSubject != "" {
+			if err := t.dlqConsumerMessage(ackCtx, js, b, msg, execErr, 1, false); err != nil {
+				t.log.Error("consumer_dead_letter_failed", "subject", msg.Subject, "error", err)
+			}
+		}
+		return
+	}
+
+	if maxDeliverReached(deliveries, b.MaxDeliver) {
+		if b.DeadLetterSubject != "" {
+			if err := t.dlqConsumerMessage(ackCtx, js, b, msg, execErr, deliveries, true); err != nil {
+				t.log.Error("consumer_dead_letter_failed", "subject", msg.Subject, "error", err)
+				t.nakConsumerMessage(ackCtx, b, msg, deliveries, execErr)
+			}
+		} else if err := msg.Term(nats.Context(ackCtx)); err != nil {
+			t.log.Error("consumer_term_failed", "subject", msg.Subject, "error", MapError(err))
+		}
 
 		return
 	}
 
-	delay := time.Second
-	if retryable, ok := execErr.(interface{ RetryAfter() time.Duration }); ok && retryable.RetryAfter() > 0 {
-		delay = retryable.RetryAfter()
+	t.nakConsumerMessage(ackCtx, b, msg, deliveries, execErr)
+}
+
+func (t *Transport) nakConsumerMessage(
+	ctx context.Context, b ConsumerBinding, msg *nats.Msg, deliveries uint64, execErr error,
+) {
+	delay := consumerRetryDelay(b, deliveries, execErr)
+	if err := msg.NakWithDelay(delay, nats.Context(ctx)); err != nil {
+		t.log.Error("consumer_nak_failed", "subject", msg.Subject, "delay", delay, "error", MapError(err))
+	}
+}
+
+func consumerRetryDelay(b ConsumerBinding, deliveries uint64, execErr error) time.Duration {
+	if delay := retryAfter(execErr); delay > 0 {
+		return delay
+	}
+	if len(b.BackOff) > 0 {
+		return b.BackOff[backoffIndex(deliveries, len(b.BackOff))]
 	}
 
-	_ = msg.NakWithDelay(delay) //nolint:errcheck // NAck failure falls back to AckWait redelivery
+	return time.Second
+}
+
+func maxDeliverReached(deliveries uint64, maxDeliver int) bool {
+	limit, ok := maxDeliveryLimit(maxDeliver)
+	return !ok || deliveries >= limit
+}
+
+func maxDeliverExceeded(deliveries uint64, maxDeliver int) bool {
+	limit, ok := maxDeliveryLimit(maxDeliver)
+	return !ok || deliveries > limit
+}
+
+func maxDeliveryLimit(maxDeliver int) (uint64, bool) {
+	if maxDeliver <= 0 {
+		return 0, false
+	}
+	return uint64(maxDeliver), true // #nosec G115 -- positive int fits in uint64 on supported Go architectures.
+}
+
+func backoffIndex(deliveries uint64, count int) int {
+	if count <= 1 || deliveries <= 1 {
+		return 0
+	}
+	last := count - 1
+	lastDelivery := uint64(last) // #nosec G115 -- last is nonnegative and int is at most 64 bits.
+	if deliveries-1 >= lastDelivery {
+		return last
+	}
+	return int(deliveries - 1) // #nosec G115 -- checked smaller than the int-sized last index.
+}
+
+func retryAfter(err error) time.Duration {
+	var retryable interface{ RetryAfter() time.Duration }
+	if errors.As(err, &retryable) {
+		return retryable.RetryAfter()
+	}
+	return 0
 }
 
 func (t *Transport) dlqConsumerMessage(
-	js nats.JetStreamContext, b ConsumerBinding, msg *nats.Msg,
-	execErr error, deliveries uint64,
-) {
+	ctx context.Context, js nats.JetStreamContext, b ConsumerBinding, msg *nats.Msg,
+	execErr error, deliveries uint64, terminate bool,
+) error {
 	headers := make(map[string]string, len(msg.Header))
 	for k, vv := range msg.Header {
 		if len(vv) > 0 {
@@ -416,21 +563,26 @@ func (t *Transport) dlqConsumerMessage(
 
 	payload, err := json.Marshal(dead)
 	if err != nil {
-		_ = msg.Nak() //nolint:errcheck // NAck failure falls back to AckWait redelivery
-
-		return
+		return fmt.Errorf("marshal dead-letter message: %w", err)
 	}
 
 	dlqMsg := nats.NewMsg(b.DeadLetterSubject)
-
 	dlqMsg.Data = payload
-	if _, err := js.PublishMsg(dlqMsg); err != nil {
-		_ = msg.Nak() //nolint:errcheck // NAck failure falls back to AckWait redelivery
-
-		return
+	metaInfo, err := msg.Metadata()
+	if err != nil {
+		return MapError(err)
+	}
+	msgID := fmt.Sprintf("%s:%d", metaInfo.Stream, metaInfo.Sequence.Stream)
+	if _, err := js.PublishMsg(dlqMsg, nats.MsgId(msgID), nats.Context(ctx)); err != nil {
+		return MapError(err)
 	}
 
-	_ = msg.Term() //nolint:errcheck // terminal state; no retry possible
+	if terminate {
+		if err := msg.Term(nats.Context(ctx)); err != nil {
+			return MapError(err)
+		}
+	}
+	return nil
 }
 
 var _ action.Binding = ConsumerBinding{}
