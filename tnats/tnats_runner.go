@@ -61,7 +61,6 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 		t.signalReady(jsErr)
 		return nil, jsErr
 	}
-
 	defer func() {
 		runCancel()
 
@@ -88,6 +87,10 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 			t.log.Warn("nats_transport_close_failed", "error", MapError(err))
 		}
 	}()
+	if err := t.configureIdempotencyStore(js); err != nil {
+		t.signalReady(err)
+		return nil, err
+	}
 
 	t.mu.RLock()
 	actions := append([]action.AnyAction(nil), t.actions...)
@@ -123,6 +126,27 @@ func (t *Transport) Do(ctx context.Context, _ any) (any, error) {
 		}
 		return nil, xerr.Unavailable("nats: connection closed", nc.LastError())
 	}
+}
+
+func (t *Transport) configureIdempotencyStore(js nats.JetStreamContext) error {
+	if t.idempotencyBucket == "" {
+		return nil
+	}
+	if t.idempotencyStoreSet {
+		return xerr.Conflict("configure either an idempotency store or a JetStream KV bucket, not both")
+	}
+	if js == nil {
+		return xerr.BadRequest("JetStream is required for the configured idempotency bucket")
+	}
+	if _, err := js.KeyValue(t.idempotencyBucket); err != nil {
+		return xerr.Unavailable("open pre-provisioned shared idempotency bucket", MapError(err))
+	}
+	coordinator, err := NewKVIdempotencyCoordinator(js, t.idempotencyBucket)
+	if err != nil {
+		return err
+	}
+	t.idemStore = coordinator
+	return nil
 }
 
 func (t *Transport) mountActions(

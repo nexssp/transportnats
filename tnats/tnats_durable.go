@@ -98,11 +98,14 @@ func (t *Transport) handleDurableMessage(
 		return
 	}
 
-	var execErr error
-	if meta != nil && meta.Idempotency.Enabled {
-		_, execErr = executeWithIdempotency(reqCtx, t.idemStore, meta.Idempotency, ex, msg, decoder, t.codec)
-	} else {
-		_, execErr = ex.ExecuteDecoded(reqCtx, decoder)
+	reqCtx, identityErr := applyDurableDeliveryIdentity(reqCtx, msg, b, t.codec)
+	execErr := identityErr
+	if identityErr == nil {
+		if meta != nil && meta.Idempotency.Enabled {
+			_, execErr = executeWithIdempotency(reqCtx, t.idemStore, meta.Idempotency, ex, msg, decoder, t.codec)
+		} else {
+			_, execErr = ex.ExecuteDecoded(reqCtx, decoder)
+		}
 	}
 
 	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)

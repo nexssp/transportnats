@@ -53,6 +53,12 @@ func TestLibraryConfigDefaultsAreNormalized(t *testing.T) {
 	}
 }
 
+func TestNewBundleAcceptsSharedIdempotencyBucket(t *testing.T) {
+	if _, err := NewBundle(Config{IdempotencyBucket: "AGENT_IDEMPOTENCY"}); err != nil {
+		t.Fatalf("NewBundle() with shared idempotency bucket: %v", err)
+	}
+}
+
 func TestNATSRequestModifierCreatesRequestBinding(t *testing.T) {
 	modifierTable := compiler.NewModifierTable(Modifiers()...)
 	base := action.New("inventory.check", func(_ context.Context, req any) (any, error) {
@@ -94,6 +100,63 @@ func TestNATSRPCModifierCreatesRequestBinding(t *testing.T) {
 	binding, ok := bindings[0].(tnats.RequestBinding)
 	if !ok || binding.Subject != "inventory.check" {
 		t.Fatalf("binding = %#v, want request binding for inventory.check", bindings[0])
+	}
+}
+
+func TestNATSDurableModifierSupportsDeliveryIdentityField(t *testing.T) {
+	modifierTable := compiler.NewModifierTable(Modifiers()...)
+	base := action.New("agent.process", func(_ context.Context, req any) (any, error) {
+		return req, nil
+	}).Build()
+
+	modified, err := modifierTable.ApplyAll(base, []string{
+		"nats_durable=AGENT_JOBS:agent.jobs:agent-workers:agent.jobs.dlq:job_id",
+	})
+	if err != nil {
+		t.Fatalf("apply nats_durable modifier: %v", err)
+	}
+	bindings := modified.GetBindings()
+	if len(bindings) != 1 {
+		t.Fatalf("binding count = %d, want 1", len(bindings))
+	}
+	binding, ok := bindings[0].(tnats.DurableBinding)
+	if !ok || binding.DeliveryIdentityField != "job_id" {
+		t.Fatalf("binding = %#v, want durable binding with job_id delivery identity", bindings[0])
+	}
+}
+
+func TestNATSDurableModifierKeepsLegacyBinding(t *testing.T) {
+	modifierTable := compiler.NewModifierTable(Modifiers()...)
+	base := action.New("agent.process", func(_ context.Context, req any) (any, error) {
+		return req, nil
+	}).Build()
+
+	modified, err := modifierTable.ApplyAll(base, []string{
+		"nats_durable=AGENT_JOBS:agent.jobs:agent-workers:agent.jobs.dlq",
+	})
+	if err != nil {
+		t.Fatalf("apply legacy nats_durable modifier: %v", err)
+	}
+	binding, ok := modified.GetBindings()[0].(tnats.DurableBinding)
+	if !ok || binding.DeliveryIdentityField != "" {
+		t.Fatalf("binding = %#v, want legacy durable binding without identity field", modified.GetBindings()[0])
+	}
+}
+
+func TestNATSDurableModifierRejectsEmptyDeliveryIdentityField(t *testing.T) {
+	modifierTable := compiler.NewModifierTable(Modifiers()...)
+	base := action.New("agent.process", func(_ context.Context, req any) (any, error) {
+		return req, nil
+	}).Build()
+
+	modified, err := modifierTable.ApplyAll(base, []string{
+		"nats_durable=AGENT_JOBS:agent.jobs:agent-workers:agent.jobs.dlq:",
+	})
+	if err != nil {
+		t.Fatalf("apply nats_durable modifier: %v", err)
+	}
+	if _, ok := modified.GetBindings()[0].(invalidBinding); !ok {
+		t.Fatalf("binding = %T, want invalidBinding for an empty identity field", modified.GetBindings()[0])
 	}
 }
 

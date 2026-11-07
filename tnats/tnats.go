@@ -3,6 +3,7 @@ package tnats
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +48,8 @@ type Transport struct {
 	actions              []action.AnyAction
 	codec                codec.Codec
 	idemStore            action.IdempotencyStore
+	idempotencyBucket    string
+	idempotencyStoreSet  bool
 	microServices        []micro.Service
 	options              []nats.Option
 	productionSecurity   *ProductionSecurity
@@ -115,7 +118,17 @@ func WithIdempotencyStore(s action.IdempotencyStore) Option {
 	return func(t *Transport) {
 		if s != nil {
 			t.idemStore = s
+			t.idempotencyStoreSet = true
 		}
+	}
+}
+
+// WithKVIdempotencyBucket uses an existing JetStream KV bucket as the shared
+// idempotency coordinator when the transport starts. The bucket must be
+// provisioned before startup; the default remains process-local memory.
+func WithKVIdempotencyBucket(bucket string) Option {
+	return func(t *Transport) {
+		t.idempotencyBucket = strings.TrimSpace(bucket)
 	}
 }
 

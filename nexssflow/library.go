@@ -25,15 +25,16 @@ func init() {
 
 // Config controls one Flow-owned NATS transport instance.
 type Config struct {
-	URL            string        `nflow:"url"              default:"nats://127.0.0.1:4222"`
-	Name           string        `nflow:"name"             default:"nflow-client"`
-	Timeout        time.Duration `nflow:"timeout"          default:"5s"`
-	CredsFile      string        `nflow:"creds_file"`
-	Token          string        `nflow:"token"`
-	RootCAFile     string        `nflow:"root_ca_file"`
-	ClientCertFile string        `nflow:"client_cert_file"`
-	ClientKeyFile  string        `nflow:"client_key_file"`
-	Production     bool          `nflow:"production"`
+	URL               string        `nflow:"url"              default:"nats://127.0.0.1:4222"`
+	Name              string        `nflow:"name"             default:"nflow-client"`
+	Timeout           time.Duration `nflow:"timeout"          default:"5s"`
+	CredsFile         string        `nflow:"creds_file"`
+	Token             string        `nflow:"token"`
+	RootCAFile        string        `nflow:"root_ca_file"`
+	ClientCertFile    string        `nflow:"client_cert_file"`
+	ClientKeyFile     string        `nflow:"client_key_file"`
+	IdempotencyBucket string        `nflow:"idempotency_bucket"`
+	Production        bool          `nflow:"production"`
 }
 
 func Bundle(rawOpts map[string]string) compiler.Bundle {
@@ -61,7 +62,10 @@ func NewBundle(cfg Config) (compiler.Bundle, error) {
 		return compiler.Bundle{}, errors.New("client_cert_file and client_key_file must be configured together")
 	}
 
-	opts := []tnats.Option{tnats.WithNATSOptions(nats.Name(cfg.Name))}
+	opts := []tnats.Option{
+		tnats.WithNATSOptions(nats.Name(cfg.Name)),
+		tnats.WithKVIdempotencyBucket(cfg.IdempotencyBucket),
+	}
 	if cfg.Production {
 		opts = append(opts, tnats.WithProductionSecurity(tnats.ProductionSecurity{
 			RootCAFile:      cfg.RootCAFile,
@@ -147,10 +151,18 @@ func Modifiers() []compiler.Modifier {
 
 		compiler.String("nats_durable", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			parts := strings.Split(raw, ":")
-			if len(parts) != 4 {
-				return b.Route(invalidBinding("@nats_durable expects stream:subject:durable:dlq"))
+			if len(parts) != 4 && len(parts) != 5 {
+				return b.Route(invalidBinding("@nats_durable expects stream:subject:durable:dlq[:identity-field]"))
 			}
-			return b.Route(tnats.DurableWork(parts[0], parts[1], parts[2], parts[3]))
+			binding := tnats.DurableWork(parts[0], parts[1], parts[2], parts[3])
+			if len(parts) == 5 {
+				field := strings.TrimSpace(parts[4])
+				if field == "" {
+					return b.Route(invalidBinding("@nats_durable identity field must be non-empty"))
+				}
+				binding = binding.WithDeliveryIdentityField(field)
+			}
+			return b.Route(binding)
 		}),
 
 		compiler.String("nats_consumer", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {

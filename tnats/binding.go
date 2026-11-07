@@ -2,6 +2,7 @@ package tnats
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nexssp/kernel/action"
@@ -73,14 +74,15 @@ func WatchKV(bucket, key string) KVBinding {
 
 // DurableBinding binduje kolejki pracownicze JetStream ze wsparciem dla DLQ.
 type DurableBinding struct {
-	Stream            string
-	Subject           string
-	Durable           string
-	DeadLetterSubject string
-	MaxDeliver        int
-	AckWait           time.Duration
-	RetryDelay        time.Duration
-	MaxAckPending     int
+	Stream                string
+	Subject               string
+	Durable               string
+	DeadLetterSubject     string
+	DeliveryIdentityField string
+	MaxDeliver            int
+	AckWait               time.Duration
+	RetryDelay            time.Duration
+	MaxAckPending         int
 }
 
 func (b DurableBinding) String() string {
@@ -119,6 +121,13 @@ func (b DurableBinding) WithDeliveryPolicy(
 		b.MaxAckPending = maxAckPending
 	}
 
+	return b
+}
+
+// WithDeliveryIdentityField assigns a fresh execution ID to every delivery and
+// uses the named payload string field as its stable request and idempotency ID.
+func (b DurableBinding) WithDeliveryIdentityField(field string) DurableBinding {
+	b.DeliveryIdentityField = strings.TrimSpace(field)
 	return b
 }
 
