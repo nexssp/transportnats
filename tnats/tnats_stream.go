@@ -31,11 +31,14 @@ func (t *Transport) ensureJetStream() (nats.JetStreamContext, error) {
 }
 
 func (t *Transport) ensureDurableInfra(js nats.JetStreamContext, b DurableBinding) error {
+	if b.ResultStream != "" {
+		return validateDurableResultStream(js, b)
+	}
 	if err := t.ensureStream(js, b.Stream, b.Subject); err != nil {
 		return err
 	}
-
-	return t.ensureStream(js, b.Stream+"_DLQ", b.DeadLetterSubject)
+	dlqStream := b.Stream + "_DLQ"
+	return t.ensureStream(js, dlqStream, b.DeadLetterSubject)
 }
 
 func (t *Transport) ensureStream(js nats.JetStreamContext, name string, subjects ...string) error {

@@ -151,16 +151,24 @@ func Modifiers() []compiler.Modifier {
 
 		compiler.String("nats_durable", func(b *action.Builder[any, any], raw string) *action.Builder[any, any] {
 			parts := strings.Split(raw, ":")
-			if len(parts) != 4 && len(parts) != 5 {
-				return b.Route(invalidBinding("@nats_durable expects stream:subject:durable:dlq[:identity-field]"))
+			if len(parts) != 4 && len(parts) != 5 && len(parts) != 7 {
+				return b.Route(invalidBinding("@nats_durable expects stream:subject:durable:dlq[:identity-field[:result-stream:result-subject]]"))
 			}
 			binding := tnats.DurableWork(parts[0], parts[1], parts[2], parts[3])
-			if len(parts) == 5 {
+			if len(parts) >= 5 {
 				field := strings.TrimSpace(parts[4])
 				if field == "" {
 					return b.Route(invalidBinding("@nats_durable identity field must be non-empty"))
 				}
 				binding = binding.WithDeliveryIdentityField(field)
+			}
+			if len(parts) == 7 {
+				resultStream := strings.TrimSpace(parts[5])
+				resultSubject := strings.TrimSpace(parts[6])
+				if resultStream == "" || resultSubject == "" {
+					return b.Route(invalidBinding("@nats_durable result stream and subject must both be non-empty"))
+				}
+				binding = binding.WithResult(resultStream, resultSubject)
 			}
 			return b.Route(binding)
 		}),

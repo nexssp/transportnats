@@ -79,6 +79,8 @@ type DurableBinding struct {
 	Durable               string
 	DeadLetterSubject     string
 	DeliveryIdentityField string
+	ResultStream          string
+	ResultSubject         string
 	MaxDeliver            int
 	AckWait               time.Duration
 	RetryDelay            time.Duration
@@ -128,6 +130,15 @@ func (b DurableBinding) WithDeliveryPolicy(
 // uses the named payload string field as its stable request and idempotency ID.
 func (b DurableBinding) WithDeliveryIdentityField(field string) DurableBinding {
 	b.DeliveryIdentityField = strings.TrimSpace(field)
+	return b
+}
+
+// WithResult configures an explicit result envelope stream and publish subject.
+// Result listeners also require a shared KV bucket via WithKVIdempotencyBucket.
+// The stream must already exist and cover the subject when the listener starts.
+func (b DurableBinding) WithResult(stream, subject string) DurableBinding {
+	b.ResultStream = strings.TrimSpace(stream)
+	b.ResultSubject = strings.TrimSpace(subject)
 	return b
 }
 

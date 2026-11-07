@@ -124,8 +124,8 @@ func WithIdempotencyStore(s action.IdempotencyStore) Option {
 }
 
 // WithKVIdempotencyBucket uses an existing JetStream KV bucket as the shared
-// idempotency coordinator when the transport starts. The bucket must be
-// provisioned before startup; the default remains process-local memory.
+// idempotency coordinator and durable result ledger when the transport starts.
+// The bucket must be provisioned before startup; the default remains process-local memory.
 func WithKVIdempotencyBucket(bucket string) Option {
 	return func(t *Transport) {
 		t.idempotencyBucket = strings.TrimSpace(bucket)

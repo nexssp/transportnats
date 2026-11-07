@@ -160,6 +160,49 @@ func TestNATSDurableModifierRejectsEmptyDeliveryIdentityField(t *testing.T) {
 	}
 }
 
+func TestNATSDurableModifierSupportsResultEnvelopeSyntax(t *testing.T) {
+	modifierTable := compiler.NewModifierTable(Modifiers()...)
+	base := action.New("agent.process", func(_ context.Context, req any) (any, error) {
+		return req, nil
+	}).Build()
+
+	for _, test := range []struct {
+		name        string
+		modifier    string
+		wantResult  bool
+		wantInvalid bool
+	}{
+		{name: "legacy four part", modifier: "nats_durable=JOBS:jobs:workers:jobs.dlq"},
+		{name: "identity five part", modifier: "nats_durable=JOBS:jobs:workers:jobs.dlq:job_id"},
+		{name: "result seven part", modifier: "nats_durable=JOBS:jobs:workers:jobs.dlq:job_id:RESULTS:jobs.results", wantResult: true},
+		{name: "missing result subject", modifier: "nats_durable=JOBS:jobs:workers:jobs.dlq:job_id:RESULTS:", wantInvalid: true},
+		{name: "six part partial result", modifier: "nats_durable=JOBS:jobs:workers:jobs.dlq:job_id:RESULTS", wantInvalid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			modified, err := modifierTable.ApplyAll(base, []string{test.modifier})
+			if err != nil {
+				t.Fatalf("apply nats_durable modifier: %v", err)
+			}
+			if test.wantInvalid {
+				if _, ok := modified.GetBindings()[0].(invalidBinding); !ok {
+					t.Fatalf("binding = %T, want invalidBinding", modified.GetBindings()[0])
+				}
+				return
+			}
+			binding, ok := modified.GetBindings()[0].(tnats.DurableBinding)
+			if !ok {
+				t.Fatalf("binding = %T, want DurableBinding", modified.GetBindings()[0])
+			}
+			if test.wantResult && (binding.ResultStream != "RESULTS" || binding.ResultSubject != "jobs.results" || binding.DeliveryIdentityField != "job_id") {
+				t.Fatalf("binding = %#v, want configured result envelope", binding)
+			}
+			if !test.wantResult && (binding.ResultStream != "" || binding.ResultSubject != "") {
+				t.Fatalf("legacy binding unexpectedly configured results: %#v", binding)
+			}
+		})
+	}
+}
+
 func TestNATSObjectModifierRequiresSeparator(t *testing.T) {
 	modifierTable := compiler.NewModifierTable(Modifiers()...)
 	base := action.New("objects.watch", func(_ context.Context, req any) (any, error) {

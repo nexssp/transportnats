@@ -2,6 +2,8 @@ package tnats
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -18,6 +20,11 @@ func (t *Transport) subscribeDurable(
 		return err
 	}
 
+	if b.ResultStream != "" {
+		if _, ok := t.idemStore.(*KVIdempotencyCoordinator); !ok {
+			return xerr.BadRequest("durable results require WithKVIdempotencyBucket with a pre-provisioned bucket")
+		}
+	}
 	if err := t.ensureDurableInfra(js, b); err != nil {
 		return err
 	}
@@ -80,6 +87,11 @@ func (t *Transport) handleDurableMessage(
 		return
 	}
 	deliveries := metaInfo.NumDelivered
+	if b.ResultStream != "" {
+		deliveryCtx, jobID, identityErr := applyDurableDeliveryIdentity(reqCtx, msg, b, t.codec)
+		t.handleDurableResultMessage(deliveryCtx, js, ex, b, meta, msg, jobID, identityErr, deliveries, decoder)
+		return
+	}
 	if maxDeliverExceeded(deliveries, b.MaxDeliver) {
 		ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultShutdownTimeout)
 		defer cancel()
@@ -98,7 +110,7 @@ func (t *Transport) handleDurableMessage(
 		return
 	}
 
-	reqCtx, identityErr := applyDurableDeliveryIdentity(reqCtx, msg, b, t.codec)
+	reqCtx, _, identityErr := applyDurableDeliveryIdentity(reqCtx, msg, b, t.codec)
 	execErr := identityErr
 	if identityErr == nil {
 		if meta != nil && meta.Idempotency.Enabled {
@@ -154,6 +166,58 @@ func validateDurableBinding(b DurableBinding) error {
 	if b.MaxDeliver <= 0 || b.AckWait <= 0 || b.RetryDelay <= 0 || b.MaxAckPending <= 0 {
 		return xerr.BadRequest("durable delivery policy parameters must be positive")
 	}
-
+	resultConfigured := b.ResultStream != "" || b.ResultSubject != ""
+	if resultConfigured {
+		if b.ResultStream == "" || b.ResultSubject == "" {
+			return xerr.BadRequest("durable result envelopes require both result stream and subject")
+		}
+		if strings.TrimSpace(b.ResultStream) != b.ResultStream || strings.TrimSpace(b.ResultSubject) != b.ResultSubject {
+			return xerr.BadRequest("durable result stream and subject cannot have surrounding whitespace")
+		}
+		if b.DeliveryIdentityField == "" || strings.TrimSpace(b.DeliveryIdentityField) != b.DeliveryIdentityField {
+			return xerr.BadRequest("durable result envelopes require a delivery identity field")
+		}
+		if strings.ContainsAny(b.ResultSubject, "*>") {
+			return xerr.BadRequest("durable result subject must be concrete and cannot contain wildcards")
+		}
+	}
 	return nil
+}
+
+func validateDurableResultStream(js nats.JetStreamContext, b DurableBinding) error {
+	for _, stream := range []struct {
+		name    string
+		subject string
+		role    string
+	}{
+		{name: b.ResultStream, subject: b.ResultSubject, role: "result"},
+		{name: b.Stream, subject: b.Subject, role: "job"},
+		{name: b.Stream + "_DLQ", subject: b.DeadLetterSubject, role: "dead-letter"},
+	} {
+		info, err := js.StreamInfo(stream.name)
+		if err != nil {
+			return MapError(err)
+		}
+		if err := validateDurableStreamConfig(info.Config, stream.subject, stream.role); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateDurableResultConfig(config nats.StreamConfig, subject string) error {
+	return validateDurableStreamConfig(config, subject, "result")
+}
+
+func validateDurableStreamConfig(config nats.StreamConfig, subject, role string) error {
+	if config.Storage != nats.FileStorage || config.Retention != nats.LimitsPolicy ||
+		config.Discard != nats.DiscardNew || config.MaxAge > 0 {
+		return xerr.BadRequest(fmt.Sprintf("durable %s stream must use file storage, limits retention, discard-new, and no max age", role))
+	}
+	for _, configured := range config.Subjects {
+		if subjectPatternCovers(configured, subject) {
+			return nil
+		}
+	}
+	return xerr.BadRequest(fmt.Sprintf("JetStream %s stream does not cover configured subject", role))
 }

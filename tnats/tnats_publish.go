@@ -42,7 +42,11 @@ func (t *Transport) PublishDurable(ctx context.Context, binding DurableBinding, 
 	}
 
 	cacheKey := binding.Stream + ":" + binding.Subject
-	if _, ok := t.verifiedStreams.Load(cacheKey); !ok {
+	if binding.ResultStream != "" {
+		if infraErr := t.ensureDurableInfra(js, binding); infraErr != nil {
+			return infraErr
+		}
+	} else if _, ok := t.verifiedStreams.Load(cacheKey); !ok {
 		if infraErr := t.ensureDurableInfra(js, binding); infraErr != nil {
 			return infraErr
 		}

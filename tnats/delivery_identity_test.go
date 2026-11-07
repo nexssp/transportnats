@@ -26,10 +26,14 @@ func TestApplyDurableDeliveryIdentityKeepsRequestIDAndRefreshesExecutionID(t *te
 	var executionIDs []string
 	for range 2 {
 		ctx, _, release := xctx.NewScope(parent)
-		ctx, err := applyDurableDeliveryIdentity(ctx, message, binding, codec.Default)
+		ctx, jobID, err := applyDurableDeliveryIdentity(ctx, message, binding, codec.Default)
 		if err != nil {
 			release()
 			t.Fatalf("apply delivery identity: %v", err)
+		}
+		if jobID != "job-42" {
+			release()
+			t.Fatalf("parsed job ID = %q, want job-42", jobID)
 		}
 		requestID := xctx.RequestIDFrom(ctx)
 		executionID := xctx.ExecutionIDFrom(ctx)
@@ -92,8 +96,12 @@ func TestApplyDurableDeliveryIdentityRejectsInvalidOrConflictingIdentity(t *test
 		t.Run(test.name, func(t *testing.T) {
 			ctx, _, release := xctx.NewScope(context.Background())
 			defer release()
-			if _, err := applyDurableDeliveryIdentity(ctx, test.message, binding, codec.Default); err == nil {
+			_, jobID, err := applyDurableDeliveryIdentity(ctx, test.message, binding, codec.Default)
+			if err == nil {
 				t.Fatal("applyDurableDeliveryIdentity() succeeded, want validation error")
+			}
+			if test.name == "conflicting idempotency key" && jobID != "job-42" {
+				t.Fatalf("parsed job ID = %q, want job-42 despite conflicting key", jobID)
 			}
 		})
 	}
@@ -103,11 +111,11 @@ func TestApplyDurableDeliveryIdentityIsOptIn(t *testing.T) {
 	ctx, _, release := xctx.NewScope(context.Background())
 	defer release()
 	message := &nats.Msg{Data: []byte(`{"job_id":"job-42"}`)}
-	got, err := applyDurableDeliveryIdentity(ctx, message, DurableWork("AGENT_JOBS", "agent.jobs", "workers", "agent.jobs.dlq"), codec.Default)
+	got, jobID, err := applyDurableDeliveryIdentity(ctx, message, DurableWork("AGENT_JOBS", "agent.jobs", "workers", "agent.jobs.dlq"), codec.Default)
 	if err != nil {
 		t.Fatalf("apply default delivery identity: %v", err)
 	}
-	if got != ctx || xctx.RequestIDFrom(got) != "" || xctx.ExecutionIDFrom(got) != "" || message.Header != nil {
+	if got != ctx || jobID != "" || xctx.RequestIDFrom(got) != "" || xctx.ExecutionIDFrom(got) != "" || message.Header != nil {
 		t.Fatalf("default binding changed identity or headers: request=%q execution=%q headers=%#v", xctx.RequestIDFrom(got), xctx.ExecutionIDFrom(got), message.Header)
 	}
 }

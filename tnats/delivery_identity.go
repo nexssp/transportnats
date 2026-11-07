@@ -15,10 +15,10 @@ const idempotencyKeyHeader = "Idempotency-Key"
 
 func applyDurableDeliveryIdentity(
 	ctx context.Context, msg *nats.Msg, binding DurableBinding, payloadCodec codec.Codec,
-) (context.Context, error) {
+) (context.Context, string, error) {
 	field := binding.DeliveryIdentityField
 	if field == "" {
-		return ctx, nil
+		return ctx, "", nil
 	}
 
 	if payloadCodec == nil {
@@ -26,22 +26,22 @@ func applyDurableDeliveryIdentity(
 	}
 	var payload map[string]any
 	if err := payloadCodec.Unmarshal(msg.Data, &payload); err != nil {
-		return ctx, xerr.BadRequest("durable delivery identity requires an object payload", err)
+		return ctx, "", xerr.BadRequest("durable delivery identity requires an object payload", err)
 	}
 
 	requestID, ok := payload[field].(string)
 	if !ok {
-		return ctx, xerr.BadRequest("durable payload identity field " + field + " must be a string")
+		return ctx, "", xerr.BadRequest("durable payload identity field " + field + " must be a string")
 	}
 	if requestID == "" || strings.TrimSpace(requestID) != requestID || len(requestID) > 256 || strings.ContainsRune(requestID, '\x00') {
-		return ctx, xerr.BadRequest("durable payload identity field " + field + " must be a non-empty ID of at most 256 bytes without NUL or surrounding whitespace")
+		return ctx, "", xerr.BadRequest("durable payload identity field " + field + " must be a non-empty ID of at most 256 bytes without NUL or surrounding whitespace")
 	}
 
 	if msg.Header == nil {
 		msg.Header = make(nats.Header)
 	}
 	if key := msg.Header.Get(idempotencyKeyHeader); key != "" && key != requestID {
-		return ctx, xerr.Conflict("Idempotency-Key must match durable payload identity field " + field)
+		return ctx, requestID, xerr.Conflict("Idempotency-Key must match durable payload identity field " + field)
 	}
 
 	executionID := identity.NewID()
@@ -51,5 +51,5 @@ func applyDurableDeliveryIdentity(
 	ctx = xctx.WithRequestID(ctx, requestID)
 	ctx = xctx.WithExecutionID(ctx, executionID)
 	ctx = xctx.WithRootExecutionID(ctx, executionID)
-	return ctx, nil
+	return ctx, requestID, nil
 }

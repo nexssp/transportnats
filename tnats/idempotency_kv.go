@@ -21,10 +21,23 @@ const (
 	entryPrefix              = "entry."
 )
 
+var errCorruptIdempotencyLedger = errors.New("corrupt idempotency ledger")
+
 type kvClaimPayload struct {
 	Token       string `json:"token"`
 	RequestHash string `json:"req_hash"`
 	ExpiresAt   int64  `json:"exp"`
+}
+
+func decodeKVClaim(data []byte) (kvClaimPayload, error) {
+	var claim kvClaimPayload
+	if err := json.Unmarshal(data, &claim); err != nil {
+		return kvClaimPayload{}, xerr.Internal("corrupted idempotency claim in KV", errors.Join(errCorruptIdempotencyLedger, err))
+	}
+	if claim.Token == "" || claim.ExpiresAt <= 0 {
+		return kvClaimPayload{}, xerr.Internal("corrupted idempotency claim in KV", errCorruptIdempotencyLedger)
+	}
+	return claim, nil
 }
 
 type kvEntryPayload struct {
@@ -259,12 +272,9 @@ func (c *KVIdempotencyCoordinator) retryCreateClaim(
 func (c *KVIdempotencyCoordinator) resolveExistingClaim(
 	ctx context.Context, claimKey, requestHash, token string, now time.Time, data []byte, existing nats.KeyValueEntry,
 ) (action.IdempotencyClaim, error) {
-	var activeClaim kvClaimPayload
-	if err := json.Unmarshal(existing.Value(), &activeClaim); err != nil {
-		return action.IdempotencyClaim{}, xerr.Internal("corrupted idempotency claim in KV", err)
-	}
-	if activeClaim.Token == "" || activeClaim.ExpiresAt <= 0 {
-		return action.IdempotencyClaim{}, xerr.Internal("corrupted idempotency claim in KV")
+	activeClaim, err := decodeKVClaim(existing.Value())
+	if err != nil {
+		return action.IdempotencyClaim{}, err
 	}
 	if activeClaim.RequestHash != "" && activeClaim.RequestHash != requestHash {
 		return action.IdempotencyClaim{State: action.IdempotencyClaimConflict}, nil
@@ -340,12 +350,9 @@ func (c *KVIdempotencyCoordinator) extendClaimForCompletion(
 	if err != nil {
 		return 0, mapIdempotencyKVError(ctx, err)
 	}
-	var activeClaim kvClaimPayload
-	if decodeErr := json.Unmarshal(item.Value(), &activeClaim); decodeErr != nil {
-		return 0, xerr.Internal("corrupted idempotency claim in KV", decodeErr)
-	}
-	if activeClaim.Token == "" || activeClaim.ExpiresAt <= 0 {
-		return 0, xerr.Internal("corrupted idempotency claim in KV")
+	activeClaim, err := decodeKVClaim(item.Value())
+	if err != nil {
+		return 0, err
 	}
 	if activeClaim.Token != token {
 		return 0, xerr.Conflict("idempotency claim is owned by another token")
@@ -394,9 +401,9 @@ func (c *KVIdempotencyCoordinator) Release(ctx context.Context, key, token strin
 	if err != nil {
 		return mapIdempotencyKVError(ctx, err)
 	}
-	var activeClaim kvClaimPayload
-	if err := json.Unmarshal(item.Value(), &activeClaim); err != nil {
-		return xerr.Internal("corrupted idempotency claim in KV", err)
+	activeClaim, err := decodeKVClaim(item.Value())
+	if err != nil {
+		return err
 	}
 	if activeClaim.Token == token {
 		err := c.kv.Delete(claimKey, nats.LastRevision(item.Revision()))
@@ -419,15 +426,15 @@ func marshalKVEntry(entry action.IdempotencyEntry, ttl time.Duration) ([]byte, e
 func decodeKVEntry(data []byte) (action.IdempotencyEntry, bool, error) {
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(data, &object); err != nil {
-		return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV", err)
+		return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV", errors.Join(errCorruptIdempotencyLedger, err))
 	}
 	if _, wrapped := object["entry"]; wrapped {
 		var stored kvEntryPayload
 		if err := json.Unmarshal(data, &stored); err != nil {
-			return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV", err)
+			return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV", errors.Join(errCorruptIdempotencyLedger, err))
 		}
 		if stored.Entry == nil {
-			return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV")
+			return action.IdempotencyEntry{}, true, xerr.Internal("corrupted idempotency entry in KV", errCorruptIdempotencyLedger)
 		}
 		if stored.ExpiresAt != 0 && time.Now().UnixNano() >= stored.ExpiresAt {
 			return action.IdempotencyEntry{}, false, nil
@@ -437,7 +444,7 @@ func decodeKVEntry(data []byte) (action.IdempotencyEntry, bool, error) {
 
 	var legacy action.IdempotencyEntry
 	if err := json.Unmarshal(data, &legacy); err != nil {
-		return action.IdempotencyEntry{}, true, xerr.Internal("corrupted legacy idempotency entry in KV", err)
+		return action.IdempotencyEntry{}, true, xerr.Internal("corrupted legacy idempotency entry in KV", errors.Join(errCorruptIdempotencyLedger, err))
 	}
 	return legacy, true, nil
 }
@@ -496,12 +503,9 @@ func (c *KVIdempotencyCoordinator) RenewClaim(ctx context.Context, key, token st
 	if err != nil {
 		return mapIdempotencyKVError(ctx, err)
 	}
-	var activeClaim kvClaimPayload
-	if decodeErr := json.Unmarshal(item.Value(), &activeClaim); decodeErr != nil {
-		return xerr.Internal("corrupted idempotency claim in KV", decodeErr)
-	}
-	if activeClaim.Token == "" || activeClaim.ExpiresAt <= 0 {
-		return xerr.Internal("corrupted idempotency claim in KV")
+	activeClaim, err := decodeKVClaim(item.Value())
+	if err != nil {
+		return err
 	}
 	if activeClaim.Token != token {
 		return xerr.Conflict("idempotency claim is owned by another token")
