@@ -6,9 +6,9 @@ require (
 	github.com/nats-io/nats-server/v2 v2.15.1
 	github.com/nats-io/nats.go v1.55.0
 	github.com/nats-io/nkeys v0.4.16
-	github.com/nexssp/flow v0.94.0
-	github.com/nexssp/kernel v0.40.3
-	github.com/nexssp/transport v0.9.1
+	github.com/nexssp/flow v0.102.1
+	github.com/nexssp/kernel v1.0.0
+	github.com/nexssp/transport v0.20.0
 )
 
 require (
